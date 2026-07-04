@@ -128,11 +128,14 @@ def generate_pdf_bytes(markdown_content: str) -> bytes:
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.ttfonts import TTFont
 
-    # 注册中文字体（只注册一次）
+    # 注册中文字体（macOS + Linux 多路径）
     font_paths = [
-        "/System/Library/Fonts/STHeiti Light.ttc",
-        "/System/Library/Fonts/STHeiti Medium.ttc",
-        "/System/Library/Fonts/Supplemental/Songti.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",   # Debian/Ubuntu (packages.txt)
+        "/System/Library/Fonts/STHeiti Light.ttc",          # macOS
+        "/System/Library/Fonts/STHeiti Medium.ttc",          # macOS
+        "/System/Library/Fonts/Supplemental/Songti.ttc",     # macOS
+        "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
     ]
 
     cn_font_name = "Helvetica"
