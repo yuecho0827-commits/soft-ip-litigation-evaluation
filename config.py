@@ -30,8 +30,16 @@ LLM_PROVIDER = os.getenv("LLM_PROVIDER", "deepseek")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 
-# 数据库配置
-SQLITE_URL = f"sqlite:///{DB_PATH}"
+# 数据库配置（尝试创建文件数据库，失败则使用内存数据库）
+try:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    test_file = DATA_DIR / ".write_test"
+    test_file.write_text("ok")
+    test_file.unlink()
+    SQLITE_URL = f"sqlite:///{DB_PATH}"
+except (OSError, PermissionError):
+    # Streamlit Cloud 等只读环境
+    SQLITE_URL = "sqlite:///:memory:"
 
 # 应用配置
 APP_TITLE = "Soft IP 主诉评估系统"
