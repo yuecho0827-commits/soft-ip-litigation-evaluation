@@ -1,1 +1,4 @@
 fonts-wqy-zenhei
+tesseract-ocr
+tesseract-ocr-chi-sim
+tesseract-ocr-eng

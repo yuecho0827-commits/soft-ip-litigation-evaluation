@@ -14,7 +14,7 @@ from datetime import datetime
 # 添加项目根目录到 Python 路径
 sys.path.append(str(Path(__file__).parent))
 
-from config import APP_TITLE, APP_VERSION, USE_MOCK, DEEPSEEK_API_KEY
+from config import APP_TITLE, APP_VERSION, USE_MOCK
 from database import init_db, SessionLocal, Case, RuleHit, ScoreSnapshot, Report
 if USE_MOCK:
     from mock_llm import extract_case_facts, analyze_legal_elements
@@ -198,7 +198,7 @@ if page == "📝 新建案件":
                     if is_pdf_file(f.name):
                         result = parse_pdf(file_bytes, f.name)
                     elif is_image_file(f.name):
-                        result = ocr_image(file_bytes, f.name, DEEPSEEK_API_KEY)
+                        result = ocr_image(file_bytes, f.name)
                     else:
                         result = {"success": False, "text": "", "error": "不支持的文件格式"}
 
