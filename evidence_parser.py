@@ -50,7 +50,7 @@ def _init_paddleocr():
         return _PADDLEOCR_OK
     try:
         from paddleocr import PaddleOCR
-        _paddle_engine = PaddleOCR(lang='ch', use_angle_cls=True, show_log=False)
+        _paddle_engine = PaddleOCR(lang='ch', use_textline_orientation=True)
         _PADDLEOCR_OK = True
     except Exception:
         _PADDLEOCR_OK = False

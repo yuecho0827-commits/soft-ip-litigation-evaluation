@@ -25,7 +25,7 @@ from legal_rules import run_rule_engine
 from scoring import run_scoring
 from report_generator import generate_markdown_report, generate_pdf_bytes
 from evidence_parser import parse_pdf, ocr_image, is_pdf_file, is_image_file
-from report_generator import generate_pdf_bytes
+from legal_database import generate_search_queries, format_laws_for_report, format_cases_for_report
 
 # 页面配置
 st.set_page_config(
@@ -392,9 +392,22 @@ elif page == "🔍 评估分析":
                     db.add(RuleHit(case_id=case_id, rule_code=r["rule_code"], severity=r["severity"], result=r["result"], reason=r["reason"]))
                 db.commit()
 
+                # Step 2.5: 法律数据库检索
+                progress.progress(45, "法律数据库检索...")
+                st.markdown("#### 步骤 2.5/6: 法律数据库检索")
+                search_queries = generate_search_queries(case.case_description)
+                st.session_state[f"legal_queries_{case_id}"] = search_queries
+
+                if search_queries:
+                    st.info(f"📚 已生成 {len(search_queries)} 条法律检索查询")
+                    with st.expander("查看检索查询"):
+                        for i, q in enumerate(search_queries, 1):
+                            st.markdown(f"**{i}.** {q.get('text', q.get('title', ''))} &nbsp; `{q['type']}`")
+                    st.caption("💡 检索结果将在评估后由 AI 助手完成并补充到报告中")
+
                 # Step 3
                 progress.progress(55, "法律要件分析...")
-                st.markdown("#### 步骤 3/5: 法律要件分析")
+                st.markdown("#### 步骤 3/6: 法律要件分析")
                 legal_analysis = analyze_legal_elements(case_facts)
                 for el in legal_analysis.get("elements", []):
                     st.markdown(f"**{el['element']}** — {el['score']} 分")
@@ -403,7 +416,7 @@ elif page == "🔍 评估分析":
 
                 # Step 4
                 progress.progress(75, "三维评分...")
-                st.markdown("#### 步骤 4/5: 三维评分计算")
+                st.markdown("#### 步骤 4/6: 三维评分计算")
 
                 # 传入证据映射（从 mock 数据构建）
                 evidence_mapping = [
