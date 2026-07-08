@@ -24,7 +24,8 @@ else:
 from legal_rules import run_rule_engine
 from scoring import run_scoring
 from report_generator import generate_markdown_report, generate_pdf_bytes
-from evidence_parser import parse_pdf, ocr_image, is_pdf_file, is_image_file, generate_pdf_bytes
+from evidence_parser import parse_pdf, ocr_image, is_pdf_file, is_image_file
+from report_generator import generate_pdf_bytes
 
 # 页面配置
 st.set_page_config(
