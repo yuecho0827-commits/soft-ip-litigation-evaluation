@@ -16,16 +16,40 @@ sys.path.append(str(Path(__file__).parent))
 
 from config import APP_TITLE, APP_VERSION, USE_MOCK
 from database import init_db, SessionLocal, Case, RuleHit, ScoreSnapshot, Report
-if USE_MOCK:
-    from mock_llm import extract_case_facts, analyze_legal_elements
-else:
-    from llm_client import extract_case_facts_real as extract_case_facts
-    from llm_client import analyze_legal_elements_real as analyze_legal_elements
-from legal_rules import run_rule_engine
-from scoring import run_scoring
-from report_generator import generate_markdown_report, generate_pdf_bytes
 from evidence_parser import parse_pdf, ocr_image, is_pdf_file, is_image_file
-from legal_database import generate_search_queries, format_laws_for_report, format_cases_for_report
+from report_generator import generate_markdown_report, generate_pdf_bytes
+
+# 评估引擎（按 v1 方案的选择）
+if USE_MOCK:
+    from mock_llm import (
+        extract_case_facts as evaluate_rights_foundation,
+        analyze_legal_elements as evaluate_infringement,
+        check_rules as evaluate_procedure,
+        generate_score as evaluate_financial_return,
+        generate_report as evaluate_precedent_value,
+        run_moot_court as run_moot_court_simulation,
+    )
+    _mock = True
+else:
+    from llm_client import (
+        evaluate_rights_foundation,
+        evaluate_infringement,
+        evaluate_procedure,
+        evaluate_financial_return,
+        evaluate_precedent_value,
+        evaluate_evidence_readiness,
+        run_moot_court_simulation,
+    )
+    _mock = False
+
+from legal_rules import run_rule_engine
+from scoring import (
+    calculate_legal_feasibility,
+    calculate_business_expectation,
+    calculate_overall_score,
+    generate_recommendation,
+)
+from legal_database import format_laws_for_report, format_cases_for_report
 
 # 页面配置
 st.set_page_config(
@@ -371,120 +395,239 @@ elif page == "🔍 评估分析":
             status_area = st.container()
 
             with status_area:
-                # Step 1
-                progress.progress(15, "提取案情事实...")
-                st.markdown("#### 步骤 1/5: 提取案情事实")
-                case_facts = extract_case_facts(case.case_description)
-                st.success("✅ 案情事实提取完成")
-                with st.expander("查看提取内容"):
-                    st.json(case_facts)
+                # 聚合证据文本（如果有上传的文件解析结果）
+                evidence_texts = st.session_state.get("evidence_text_extra", "")
 
-                # Step 2
-                progress.progress(35, "红线风险检查...")
-                st.markdown("#### 步骤 2/5: 红线风险检查")
-                rule_results = run_rule_engine(case_facts)
-                for r in rule_results:
-                    icon = {"pass":"✅","warning":"⚠️","block":"🚫"}.get(r["severity"],"⚪")
-                    st.markdown(f"{icon} **{r['rule_name']}**: {r['result']}")
-                    st.caption(f"    {r['reason']}")
+                # ====================================================
+                # 维度一：法律可行性
+                # ====================================================
+                st.markdown("---")
+                st.markdown("## 🔍 维度一：法律可行性")
 
-                for r in rule_results:
-                    db.add(RuleHit(case_id=case_id, rule_code=r["rule_code"], severity=r["severity"], result=r["result"], reason=r["reason"]))
-                db.commit()
+                # 1.1 权利基础
+                progress.progress(10, "1/7 权利基础评估...")
+                st.markdown("### 1.1 权利基础")
+                with st.spinner("DeepSeek 正在分析商标权利基础..."):
+                    rights_result = evaluate_rights_foundation(
+                        case.case_description,
+                        uploaded_texts=evidence_texts if not _mock else ""
+                    )
+                if "error" in rights_result:
+                    st.error(f"权利基础评估失败: {rights_result.get('error', rights_result.get('raw',''))}")
+                else:
+                    st.metric("权利基础得分", f"{rights_result.get('score', 'N/A')} 分")
+                    st.write(rights_result.get('analysis', ''))
+                    with st.expander("详细分析"):
+                        st.json(rights_result)
 
-                # Step 2.5: 法律数据库检索
-                progress.progress(45, "法律数据库检索...")
-                st.markdown("#### 步骤 2.5/6: 法律数据库检索")
-                search_queries = generate_search_queries(case.case_description)
-                st.session_state[f"legal_queries_{case_id}"] = search_queries
+                # 1.2 侵权认定
+                progress.progress(25, "2/7 侵权认定评估...")
+                st.markdown("### 1.2 侵权认定")
+                with st.spinner("DeepSeek 正在分析商标侵权构成要件..."):
+                    infringement_result = evaluate_infringement(
+                        case.case_description,
+                        rights_assessment=str(rights_result.get('analysis', '')),
+                        uploaded_texts=evidence_texts if not _mock else ""
+                    )
+                if "error" in infringement_result:
+                    st.error(f"侵权认定评估失败: {infringement_result.get('error', infringement_result.get('raw',''))}")
+                else:
+                    st.metric("侵权认定得分", f"{infringement_result.get('score', 'N/A')} 分")
+                    st.write(infringement_result.get('analysis', ''))
+                    with st.expander("要件逐项分析"):
+                        for el in infringement_result.get('elements', []):
+                            icon = {"满足":"✅","存疑":"⚠️","不满足":"❌"}.get(el.get('status',''), '⚪')
+                            st.markdown(f"{icon} **{el['name']}** ({el['score']}分): {el['analysis']}")
 
-                if search_queries:
-                    st.info(f"📚 已生成 {len(search_queries)} 条法律检索查询")
-                    with st.expander("查看检索查询"):
-                        for i, q in enumerate(search_queries, 1):
-                            st.markdown(f"**{i}.** {q.get('text', q.get('title', ''))} &nbsp; `{q['type']}`")
-                    st.caption("💡 检索结果将在评估后由 AI 助手完成并补充到报告中")
+                # 1.3 诉讼程序
+                progress.progress(40, "3/7 程序审查...")
+                st.markdown("### 1.3 诉讼程序")
+                with st.spinner("DeepSeek 正在审查程序可行性..."):
+                    procedure_result = evaluate_procedure(case.case_description)
+                if "error" in procedure_result:
+                    st.error(f"程序审查失败: {procedure_result.get('error', procedure_result.get('raw',''))}")
+                else:
+                    st.metric("程序审查得分", f"{procedure_result.get('score', 'N/A')} 分")
+                    for item in procedure_result.get('items', []):
+                        icon = {"pass":"✅","warning":"⚠️","block":"🚫"}.get(item.get('status',''), '⚪')
+                        st.markdown(f"{icon} **{item['name']}**: {item['detail']}")
 
-                # Step 3
-                progress.progress(55, "法律要件分析...")
-                st.markdown("#### 步骤 3/6: 法律要件分析")
-                legal_analysis = analyze_legal_elements(case_facts)
-                for el in legal_analysis.get("elements", []):
-                    st.markdown(f"**{el['element']}** — {el['score']} 分")
-                    st.write(el['analysis'])
-                st.success("✅ 法律要件分析完成")
+                # 1.4 模拟法庭（对抗检验）
+                progress.progress(55, "4/7 模拟法庭...")
+                st.markdown("### 1.4 模拟法庭（对抗检验）")
+                with st.spinner("DeepSeek 正在进行多角色庭审模拟..."):
+                    moot_result = run_moot_court_simulation(
+                        case.case_description,
+                        rights_assessment=str(rights_result.get('analysis', '')),
+                        infringement_assessment=str(infringement_result.get('analysis', '')),
+                        evidence_summary=evidence_texts[:1500] if evidence_texts else ""
+                    )
+                if "error" in moot_result:
+                    st.warning(f"模拟法庭异常: {moot_result.get('error', moot_result.get('raw',''))[:200]}")
+                    correction_coeff = 1.0
+                else:
+                    correction_coeff = moot_result.get('correction_coefficient', 1.0)
+                    st.metric("对抗修正系数", f"{correction_coeff:.2f}")
+                    st.write(f"法官归纳: {moot_result.get('judge_summary', '')[:300]}")
+                    with st.expander("完整庭审记录"):
+                        for rnd in moot_result.get('rounds', []):
+                            st.markdown(f"**{rnd['role']}**: {rnd['content'][:500]}")
 
-                # Step 4
-                progress.progress(75, "三维评分...")
-                st.markdown("#### 步骤 4/6: 三维评分计算")
-
-                # 传入证据映射（从 mock 数据构建）
-                evidence_mapping = [
-                    {"element_id":"right","support_level":"strong"},
-                    {"element_id":"infringement","support_level":"partial"},
-                    {"element_id":"damage","support_level":"weak"}
-                ]
-
-                score_result = run_scoring(
-                    {"name": case.name, "goal_type": case.goal_type},
-                    case_facts,
-                    legal_analysis,
-                    rule_results,
-                    evidence_mapping
+                # 计算法律可行性
+                legal_score = calculate_legal_feasibility(
+                    rights_result.get('score', 0),
+                    infringement_result.get('score', 0),
+                    procedure_result.get('score', 0),
+                    correction_coeff
                 )
+                st.success(f"✅ 法律可行性综合得分: **{legal_score} 分**")
+                st.caption(f"公式: 权利基础 × 侵权认定 × 诉讼程序 × 对抗修正系数 = {rights_result.get('score',0)} × {infringement_result.get('score',0)} × {procedure_result.get('score',0)} × {correction_coeff:.2f}")
 
-                # 评分结果
+                # ====================================================
+                # 维度二：业务预期
+                # ====================================================
+                st.markdown("---")
+                st.markdown("## 💰 维度二：业务预期")
+
+                # 2.1 财务回报
+                progress.progress(70, "5/7 财务回报评估...")
+                st.markdown("### 2.1 财务回报")
+                st.caption("💡 如需类案检索辅助评估，可在评估完成后让 AI 助手通过北大法宝查询")
+                with st.spinner("DeepSeek 正在评估判赔预测和成本..."):
+                    financial_result = evaluate_financial_return(case.case_description)
+                if "error" in financial_result:
+                    st.warning(f"财务评估异常: {financial_result.get('error', financial_result.get('raw',''))[:200]}")
+                    fin_score = 50
+                else:
+                    fin_score = financial_result.get('score', 50)
+                    st.metric("财务回报得分", f"{fin_score} 分")
+                    de = financial_result.get('damages_estimate', {})
+                    if de:
+                        st.markdown(f"判赔预测: P10=¥{de.get('p10','-')} / P50=¥{de.get('p50','-')} / P90=¥{de.get('p90','-')}")
+                    st.write(financial_result.get('analysis', ''))
+
+                # 2.2 判例价值
+                progress.progress(80, "6/7 判例价值评估...")
+                st.markdown("### 2.2 判例价值")
+                st.caption("💡 如需首案检索（北大法宝），可在评估完成后让 AI 助手查询")
+                with st.spinner("DeepSeek 正在评估判例价值..."):
+                    precedent_result = evaluate_precedent_value(case.case_description)
+                if "error" in precedent_result:
+                    st.warning(f"判例价值异常: {precedent_result.get('error', precedent_result.get('raw',''))[:200]}")
+                    prec_score = 50
+                else:
+                    prec_score = precedent_result.get('score', 50)
+                    st.metric("判例价值得分", f"{prec_score} 分")
+                    st.write(precedent_result.get('analysis', ''))
+                    st.caption(f"首案指数: {precedent_result.get('first_case_index', '-')} | 影响力: {precedent_result.get('influence_level', '-')}")
+
+                # 计算业务预期
+                business_score = calculate_business_expectation(
+                    fin_score, prec_score, case.goal_type
+                )
+                st.success(f"✅ 业务预期综合得分: **{business_score} 分**")
+                goal_label = "要钱" if case.goal_type == "要钱" else "要名"
+                st.caption(f"公式({'要钱' if case.goal_type == '要钱' else '要名'}): {case.goal_type == '要钱' and '0.9×财务+0.1×判例' or '0.1×财务+0.9×判例'}")
+
+                # ====================================================
+                # 维度三：证据就绪度
+                # ====================================================
+                st.markdown("---")
+                st.markdown("## 📋 维度三：证据就绪度")
+                progress.progress(90, "7/7 证据就绪度评估...")
+                with st.spinner("DeepSeek 正在评估证据完整性..."):
+                    evidence_result = evaluate_evidence_readiness(
+                        case.case_description,
+                        uploaded_evidence_texts=evidence_texts,
+                        evidence_count=0
+                    )
+                if "error" in evidence_result:
+                    st.warning(f"证据评估异常: {evidence_result.get('error', evidence_result.get('raw',''))[:200]}")
+                    evidence_score = 60
+                else:
+                    evidence_score = evidence_result.get('score', 60)
+                    st.metric("证据就绪度得分", f"{evidence_score} 分")
+                    st.write(evidence_result.get('analysis', ''))
+                    with st.expander("证据矩阵诊断"):
+                        for item in evidence_result.get('evidence_matrix', []):
+                            icon = {"充足":"✅","不足":"⚠️","缺失":"❌"}.get(item.get('status',''), '⚪')
+                            st.markdown(f"{icon} **{item['requirement']}**: {item['analysis']}")
+                    if evidence_result.get('remediation_suggestions'):
+                        st.warning("补证建议: " + "; ".join(evidence_result['remediation_suggestions']))
+
+                # ====================================================
+                # 综合评分
+                # ====================================================
+                st.markdown("---")
+                progress.progress(95, "计算综合评分...")
+                st.markdown("## 🏆 综合评分")
+
+                final_score = calculate_overall_score(
+                    legal_score, business_score, evidence_score
+                )
+                rec = generate_recommendation(final_score, procedure_result.get('items', []))
+
                 c1, c2, c3, c4 = st.columns(4)
-                c1.metric("法律可行性", f"{score_result['legal_feasibility']} 分")
-                c2.metric("业务预期", f"{score_result['business_expectation']} 分")
-                c3.metric("证据就绪度", f"{score_result['evidence_readiness']} 分")
-                c4.metric("综合得分", f"{score_result['final_score']} 分", delta=f"建议: {score_result['recommendation']}")
+                c1.metric("法律可行性", f"{legal_score} 分")
+                c2.metric("业务预期", f"{business_score} 分")
+                c3.metric("证据就绪度", f"{evidence_score} 分")
+                c4.metric("综合得分", f"{final_score} 分", delta=rec['recommendation'])
 
-                # 雷达图（SVG）
-                radar_html = render_radar_html({
-                    "法律可行性": score_result['legal_feasibility'],
-                    "业务预期": score_result['business_expectation'],
-                    "证据就绪度": score_result['evidence_readiness']
-                })
-                st.markdown(radar_html, unsafe_allow_html=True)
+                st.caption(f"公式: 法律可行性 × 业务预期 × 证据就绪度 = {legal_score} × {business_score} × {evidence_score}")
+                st.caption(f"💡 {rec['reason']}")
 
-                st.caption(f"💡 {score_result['reason']}")
-
+                # 保存评分
                 db.add(ScoreSnapshot(
                     case_id=case_id,
-                    legal_score=score_result['legal_feasibility'],
-                    business_score=score_result['business_expectation'],
-                    evidence_score=score_result['evidence_readiness'],
-                    confidence_score=score_result.get('confidence_score', 0),
-                    final_score=score_result['final_score'],
-                    recommendation=score_result['recommendation']
+                    legal_score=legal_score, business_score=business_score,
+                    evidence_score=evidence_score, confidence_score=70,
+                    final_score=final_score, recommendation=rec['recommendation']
                 ))
+
+                # 保存附加数据供报告使用
+                st.session_state[f"rights_{case_id}"] = rights_result
+                st.session_state[f"infringement_{case_id}"] = infringement_result
+                st.session_state[f"procedure_{case_id}"] = procedure_result
+                st.session_state[f"moot_{case_id}"] = moot_result
+                st.session_state[f"financial_{case_id}"] = financial_result
+                st.session_state[f"precedent_{case_id}"] = precedent_result
+                st.session_state[f"evidence_{case_id}"] = evidence_result
+
                 db.commit()
 
-                # Step 5
-                progress.progress(90, "生成评估报告...")
-                st.markdown("#### 步骤 5/5: 生成评估报告")
-
+                # 生成报告
+                progress.progress(98, "生成报告...")
                 report_md = generate_markdown_report(
                     {"name": case.name, "cause_type": case.cause_type, "goal_type": case.goal_type, "client_org": case.client_org},
-                    score_result, rule_results, legal_analysis
+                    {
+                        "legal_feasibility": legal_score,
+                        "business_expectation": business_score,
+                        "evidence_readiness": evidence_score,
+                        "final_score": final_score,
+                        "recommendation": rec['recommendation'],
+                        "confidence_score": 70,
+                        "reason": rec['reason'],
+                        "action_items": []
+                    },
+                    procedure_result.get('items', []),
+                    {"elements": [
+                        {"element": "权利基础", "score": rights_result.get('score', 0), "analysis": rights_result.get('analysis', ''), "evidence_status": "已评估", "risks": rights_result.get('risks', [])},
+                        {"element": "侵权认定", "score": infringement_result.get('score', 0), "analysis": infringement_result.get('analysis', ''), "evidence_status": "已评估", "risks": infringement_result.get('risks', [])},
+                        {"element": "诉讼程序", "score": procedure_result.get('score', 0), "analysis": procedure_result.get('analysis', ''), "evidence_status": "已评估", "risks": procedure_result.get('block_items', [])},
+                    ]}
                 )
 
-                # 保存报告
                 report_dir = Path("data/reports")
                 report_dir.mkdir(parents=True, exist_ok=True)
                 md_path = report_dir / f"{case_id}_report.md"
                 md_path.write_text(report_md, encoding="utf-8")
 
-                db.add(Report(
-                    case_id=case_id, report_type="评估报告",
-                    markdown_content=report_md, pdf_uri=str(md_path)
-                ))
+                db.add(Report(case_id=case_id, report_type="评估报告", markdown_content=report_md, pdf_uri=str(md_path)))
                 case.status = "completed"
                 db.commit()
 
                 progress.progress(100, "评估完成！")
-                st.success("🎉 评估完成！")
+                st.success("🎉 三维评估完成！")
                 st.balloons()
 
     finally:

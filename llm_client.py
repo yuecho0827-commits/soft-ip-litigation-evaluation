@@ -1,214 +1,408 @@
 """
-真实 LLM 客户端 - DeepSeek API
-使用标准库 urllib，零额外依赖
+LLM 评估引擎 - 基于 DeepSeek API
+严格按 v1 产品方案的三个维度 + 子维度设计
+每一环节都是一个独立的 LLM 调用，返回结构化评估结果
 """
 
 import json
 import urllib.request
 import urllib.error
-from typing import Dict, Any, List
+from typing import Dict, Any, Optional
+
 from config import DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL
 
 
-def _call_deepseek(messages: list, temperature: float = 0.3) -> str:
-    """调用 DeepSeek API，返回文本"""
+def _call_llm(system_prompt: str, user_prompt: str, temperature: float = 0.2) -> dict:
+    """调用 DeepSeek LLM，返回解析后的 JSON"""
     url = f"{DEEPSEEK_BASE_URL}/v1/chat/completions"
-    data = json.dumps({
+    payload = json.dumps({
         "model": "deepseek-chat",
-        "messages": messages,
+        "max_tokens": 4000,
         "temperature": temperature,
-        "stream": False
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ]
     }).encode("utf-8")
 
-    req = urllib.request.Request(url, data=data, method="POST")
+    req = urllib.request.Request(url, data=payload, method="POST")
     req.add_header("Authorization", f"Bearer {DEEPSEEK_API_KEY}")
     req.add_header("Content-Type", "application/json")
 
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.urlopen(req, timeout=120) as resp:
             result = json.loads(resp.read().decode("utf-8"))
-            return result["choices"][0]["message"]["content"]
+            raw = result["choices"][0]["message"]["content"].strip()
     except urllib.error.HTTPError as e:
-        error_body = e.read().decode("utf-8") if e.fp else str(e)
-        raise RuntimeError(f"API 调用失败 ({e.code}): {error_body}")
+        err = f"API 错误 ({e.code})"
+        raise RuntimeError(err)
     except Exception as e:
-        raise RuntimeError(f"API 调用异常: {e}")
+        raise RuntimeError(f"API 调用失败: {e}")
 
-
-def _call_deepseek_json(messages: list) -> dict:
-    """调用 DeepSeek API，要求返回 JSON，自动解析"""
-    # 在 system prompt 末尾追加 JSON 格式要求
-    if messages[0]["role"] == "system":
-        messages[0]["content"] += "\n\n请严格按照 JSON 格式返回，不要包含任何 markdown 标记或额外解释文字，只输出纯 JSON。"
-    else:
-        messages.insert(0, {
-            "role": "system",
-            "content": "请严格按照 JSON 格式返回，不要包含任何 markdown 标记或额外解释文字，只输出纯 JSON。"
-        })
-
-    raw = _call_deepseek(messages, temperature=0.2)
-
-    # 清理可能的 markdown 代码块标记
-    raw = raw.strip()
+    # 清理 markdown 标记
     if raw.startswith("```json"):
-        raw = raw[7:]
+        raw = raw.split("\n", 1)[1]
     if raw.startswith("```"):
         raw = raw[3:]
     if raw.endswith("```"):
         raw = raw[:-3]
     raw = raw.strip()
 
-    return json.loads(raw)
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return {"error": "JSON 解析失败", "raw": raw[:500]}
 
 
 # ============================================================
-# 案情事实提取
+# 维度一：法律可行性
 # ============================================================
 
-EXTRACT_FACTS_PROMPT = """你是一位资深的知识产权律师，请从以下案件描述中提取关键信息，以 JSON 格式返回。
+def evaluate_rights_foundation(case_description: str, party_info: str = "", uploaded_texts: str = "") -> Dict:
+    """
+    子维度 1.1：权利基础评估
+    评估商标权的有效性、使用情况、撤三风险、跨类保护可能性
+    """
+    prompt = f"""你是资深知识产权律师。请基于以下信息，评估原告商标权利基础的稳固程度。
 
-案件描述：
-{description}
+## 案情描述
+{case_description[:3000]}
 
-请提取以下内容，返回严格 JSON：
+## 当事人信息
+{party_info[:1000] if party_info else "未提供"}
 
+## 证据材料文本
+{uploaded_texts[:2000] if uploaded_texts else "未提供"}
+
+## 评估框架
+请从以下维度评估商标权利基础：
+1. 商标是否有效注册、当前状态（是否在有效期内）
+2. 是否连续三年使用（防止被撤三）
+3. 核定商品/服务范围是否覆盖侵权行为
+4. 是否为驰名商标（可跨类保护）
+5. 是否存在无效/撤销/异议风险
+
+## 返回格式（严格 JSON）
 {{
-  "parties": [
-    {{"role": "plaintiff/defendant", "name": "当事人名称", "type": "company/individual"}}
-  ],
-  "timeline": [
-    {{"date": "YYYY-MM-DD", "event": "事件描述"}}
-  ],
-  "key_facts": [
-    "关键事实1", "关键事实2"
-  ],
-  "trademark_info": {{
-    "owner": "权利人",
-    "registration_number": "注册号（如有）",
-    "category": "商品/服务类别（如有）",
-    "status": "有效/争议中"
+  "score": 0-100,
+  "sub_scores": {{
+    "validity": 0-100,
+    "usage_continuity": 0-100,
+    "coverage": 0-100,
+    "well_known_status": 0-100,
+    "risk_of_invalidation": 0-100 (分数越低=风险越高)
   }},
-  "infringement_summary": "侵权行为概述（一句话）",
-  "evidence_checklist": {{
-    "has_rights_proof": true/false,
-    "has_infringement_proof": true/false,
-    "has_damage_proof": true/false
-  }}
+  "analysis": "整体分析（150字以内）",
+  "strengths": ["优势1", "优势2"],
+  "risks": ["风险1", "风险2"],
+  "red_flag": true/false (是否<60分)
 }}
 
-注意：
-- 如果某信息在描述中未提及，用空字符串 "" 或空数组 []
-- evidence_checklist 根据描述中是否提到相关证据判断
-- key_facts 只列出与案件法律评估直接相关的事实"""
+只返回 JSON，不要任何其他文字。"""
 
-
-def extract_case_facts_real(case_description: str) -> Dict[str, Any]:
-    """真实 API：从案情描述提取事实"""
-    prompt = EXTRACT_FACTS_PROMPT.format(description=case_description)
-    result = _call_deepseek_json([
-        {"role": "system", "content": "你是一位资深知识产权律师，擅长从案件描述中提取结构化信息。"},
-        {"role": "user", "content": prompt}
-    ])
-    return result
-
-
-# ============================================================
-# 法律要件分析（商标侵权）
-# ============================================================
-
-LEGAL_ANALYSIS_PROMPT = """你是一位资深知识产权法官，请基于以下案件事实，对商标侵权的构成要件进行逐项分析，以 JSON 格式返回。
-
-## 案件事实
-- 权利人: {rights_holder}
-- 被告: {defendant}
-- 关键事实:
-{key_facts}
-- 商标状态: {trademark_status}
-
-## 分析框架（商标侵权五要件）
-
-1. **权利基础**：原告是否为注册商标权利人？商标是否有效？
-2. **商标使用行为**：被告是否在商业活动中使用了被诉标识？
-3. **商品/服务相同或类似**：被诉商品与原告商标核定使用的商品/服务是否相同或类似？
-4. **商标相同或近似**：被诉标识与原告注册商标是否相同或近似，是否容易导致混淆？
-5. **无正当理由**：被告是否有权使用该标识（如获得授权、正当使用等）？
-
-请返回严格 JSON：
-{{
-  "elements": [
-    {{
-      "element": "权利基础",
-      "score": 0-100,
-      "analysis": "分析理由",
-      "evidence_status": "充足/部分充足/不足",
-      "risks": ["风险点1", "风险点2"]
-    }},
-    {{
-      "element": "商标使用行为",
-      "score": 0-100,
-      "analysis": "分析理由",
-      "evidence_status": "充足/部分充足/不足/无法判断",
-      "risks": []
-    }},
-    {{
-      "element": "商品类似性",
-      "score": 0-100,
-      "analysis": "分析理由",
-      "evidence_status": "充足/部分充足/不足/无法判断",
-      "risks": []
-    }},
-    {{
-      "element": "商标近似性",
-      "score": 0-100,
-      "analysis": "分析理由",
-      "evidence_status": "充足/部分充足/不足/无法判断",
-      "risks": []
-    }},
-    {{
-      "element": "无正当理由",
-      "score": 0-100,
-      "analysis": "分析理由",
-      "evidence_status": "充足/部分充足/不足/无法判断",
-      "risks": []
-    }}
-  ],
-  "overall_legal_feasibility": 0-100,
-  "key_risks": ["整体风险点"],
-  "key_strengths": ["整体优势"]
-}}
-
-评分标准：
-- 81-100：要件成立可能性极高，证据充分
-- 61-80：要件可能成立，有一定证据支持
-- 41-60：要件成立存在争议，证据不足
-- 21-40：要件成立难度较大
-- 0-20：要件难以成立
-
-如果信息不足，请基于现有信息做合理推断，并在 analysis 中说明推断依据和不确定性。"""
-
-
-def analyze_legal_elements_real(case_facts: Dict) -> Dict[str, Any]:
-    """真实 API：分析法律要件"""
-    parties = case_facts.get("parties", [])
-    plaintiff = next((p["name"] for p in parties if p["role"] == "plaintiff"), "原告")
-    defendant = next((p["name"] for p in parties if p["role"] == "defendant"), "被告")
-
-    key_facts = "\n".join(f"- {f}" for f in case_facts.get("key_facts", []))
-
-    tm_info = case_facts.get("trademark_info", {})
-    trademark_status = tm_info.get("status", "未知")
-
-    prompt = LEGAL_ANALYSIS_PROMPT.format(
-        rights_holder=plaintiff,
-        defendant=defendant,
-        key_facts=key_facts,
-        trademark_status=trademark_status
+    return _call_llm(
+        "你是资深知识产权律师，专注于商标权利基础评估。请严格按 JSON 格式返回。",
+        prompt, 0.2
     )
 
-    return _call_deepseek_json([
-        {"role": "system", "content": "你是一位资深知识产权法官，擅长对商标侵权案件进行要件分析和评估。请严格返回 JSON。"},
-        {"role": "user", "content": prompt}
-    ])
+
+def evaluate_infringement(case_description: str, rights_assessment: str = "", uploaded_texts: str = "") -> Dict:
+    """
+    子维度 1.2：侵权认定评估（单方视角）
+    分析商标侵权构成要件：商标性使用、商品类似性、商标近似性、混淆可能性、正当使用
+    """
+    prompt = f"""你是资深知识产权法官。请基于以下信息，分析商标侵权构成要件的成立可能性。
+
+## 案情描述
+{case_description[:3000]}
+
+## 权利基础评估概要
+{rights_assessment[:1500] if rights_assessment else "未提供"}
+
+## 证据材料
+{uploaded_texts[:2000] if uploaded_texts else "未提供"}
+
+## 评估框架（商标侵权五要件）
+逐一分析以下要件是否满足：
+1. 被告是否构成"商标性使用"
+2. 商品/服务是否相同或类似
+3. 商标是否相同或近似
+4. 是否可能导致消费者混淆
+5. 是否为正当使用
+
+## 返回格式（严格 JSON）
+{{
+  "score": 0-100 (综合得分),
+  "elements": [
+    {{
+      "name": "商标性使用",
+      "score": 0-100,
+      "status": "满足/存疑/不满足",
+      "analysis": "分析理由"
+    }},
+    ...
+  ],
+  "analysis": "整体侵权认定分析（150字以内）",
+  "strengths": ["优势"],
+  "risks": ["风险"],
+  "red_flag": true/false
+}}
+
+只返回 JSON。"""
+
+    return _call_llm(
+        "你是资深知识产权法官，擅长商标侵权构成要件分析。请严格按 JSON 格式返回。",
+        prompt, 0.2
+    )
+
+
+def evaluate_procedure(case_description: str, party_info: str = "") -> Dict:
+    """
+    子维度 1.3：诉讼程序审查
+    时效、管辖、主体适格、前置程序
+    """
+    prompt = f"""你是资深诉讼律师。请审查以下案件的程序可行性。
+
+## 案情描述
+{case_description[:3000]}
+
+## 当事人信息
+{party_info[:1000] if party_info else "未提供"}
+
+## 评估框架
+1. 诉讼时效（3年，自知道权利受损+义务人之日起算）
+2. 管辖与仲裁（是否存在仲裁协议、管辖法院是否有利）
+3. 主体适格（原告是否为适格权利人、被告是否明确）
+4. 前置程序（行政前置、通知-删除等）
+
+## 返回格式（严格 JSON）
+{{
+  "score": 0-100,
+  "items": [
+    {{
+      "name": "诉讼时效",
+      "score": 0-100,
+      "status": "pass/warning/block",
+      "detail": "分析"
+    }},
+    ...
+  ],
+  "analysis": "整体程序评估",
+  "block_items": ["阻塞项"],
+  "red_flag": true/false
+}}
+
+只返回 JSON。"""
+
+    return _call_llm(
+        "你是资深诉讼律师，擅长程序审查。请严格按 JSON 格式返回。",
+        prompt, 0.2
+    )
+
+
+def run_moot_court_simulation(
+    case_description: str,
+    rights_assessment: str,
+    infringement_assessment: str,
+    evidence_summary: str
+) -> Dict:
+    """
+    子维度 1.4：模拟法庭（对抗检验）
+    五步庭审：原告陈述→被告答辩→举证质证→法庭辩论→法官归纳
+    """
+    prompt = f"""你是一个模拟法庭的协调者。请在原告视角的分析基础上，模拟完整的庭审过程。
+
+## 案情
+{case_description[:2000]}
+
+## 权利基础评估
+{rights_assessment[:1000]}
+
+## 侵权认定评估（原告视角）
+{infringement_assessment[:1000]}
+
+## 证据概要
+{evidence_summary[:1000] if evidence_summary else "未提供"}
+
+## 模拟法庭五步
+请按照原告（Pl）、被告（Def）、法官（Judge）三个角色，完成以下五个环节的模拟：
+1. 原告陈述（诉讼请求+事实理由+法律依据）
+2. 被告答辩（逐项反驳+抗辩策略+可能的反诉）
+3. 举证质证（原告证据的"三性"审查+被告可能的反证）
+4. 法庭辩论（围绕争议焦点各两轮）
+5. 法官归纳（争议焦点总结+薄弱点+被告抗辩强度评估+对抗修正系数）
+
+## 返回格式（严格 JSON）
+{{
+  "rounds": [
+    {{"role": "原告", "content": "..."}},
+    {{"role": "被告", "content": "..."}},
+    {{"role": "法官", "content": "..."}}
+  ],
+  "judge_summary": "法官归纳摘要",
+  "weak_points": ["原告论证薄弱点"],
+  "defense_strength": 0-100 (被告抗辩强度),
+  "correction_coefficient": 0.7-1.3 (对抗检验修正系数, 默认1.0)
+}}
+
+只返回 JSON。"""
+
+    return _call_llm(
+        "你是一个模拟法庭系统，负责协调原告、被告、法官三个角色完成庭审模拟。请严格按 JSON 格式返回。",
+        prompt, 0.3
+    )
+
+
+# ============================================================
+# 维度二：业务预期
+# ============================================================
+
+def evaluate_financial_return(
+    case_description: str,
+    infringement_severity: str = "",
+    case_law_references: str = ""
+) -> Dict:
+    """
+    子维度 2.1：财务回报评估
+    判赔预测 + 成本估算 + 时间成本 + 执行回款概率
+    """
+    prompt = f"""你是知识产权诉讼财务分析师。请评估商标侵权案件的财务可行性。
+
+## 案情
+{case_description[:3000]}
+
+## 侵权严重程度
+{infringement_severity[:1000] if infringement_severity else "待分析"}
+
+## 类案参考
+{case_law_references[:2000] if case_law_references else "暂无（建议使用北大法宝检索同类案件"}
+
+## 评估框架
+1. 预期判赔/和解金额（结合法定赔偿区间、类案数据、惩罚性赔偿概率）
+2. 诉讼成本估算（律师费、诉讼费、公证费等）
+3. 时间成本（一审+二审+执行周期）
+4. 执行回款概率（被告偿付能力）
+5. 净收益预测
+
+## 返回格式（严格 JSON）
+{{
+  "score": 0-100,
+  "damages_estimate": {{
+    "p10": 赔偿额10分位(元),
+    "p50": 赔偿额中位数(元),
+    "p90": 赔偿额90分位(元),
+    "basis": "估算依据"
+  }},
+  "cost_estimate": 预估总成本(元),
+  "time_estimate": {{
+    "first_instance_months": 一审月数,
+    "second_instance_months": 二审月数,
+    "enforcement_months": 执行月数
+  }},
+  "recovery_probability": 0-100 (回款概率百分比),
+  "net_present_value": "净收益估算",
+  "analysis": "财务分析总结"
+}}
+
+只返回 JSON。"""
+
+    return _call_llm(
+        "你是知识产权诉讼财务分析师。请严格按 JSON 格式返回。",
+        prompt, 0.2
+    )
+
+
+def evaluate_precedent_value(
+    case_description: str,
+    case_law_references: str = ""
+) -> Dict:
+    """
+    子维度 2.2：判例价值评估
+    首案潜力 + 指导性案例潜力 + 行业震慑效应 + 规则明晰价值
+    """
+    prompt = f"""你是知识产权领域专家。请评估该案件可能产生的判例价值。
+
+## 案情
+{case_description[:3000]}
+
+## 类案参考
+{case_law_references[:2000] if case_law_references else "暂无（建议使用北大法宝检索确认是否存在同类在先判决"}
+
+## 评估框架
+1. 首案潜力（涉及的法律问题是否有在先判例）
+2. 指导性案例潜力（是否符合最高法指导性案例/典型案例遴选标准）
+3. 行业震慑效应（胜诉后对其他侵权者的威慑力）
+4. 规则明晰价值（能否推动模糊法律规则的明确化）
+
+## 返回格式（严格 JSON）
+{{
+  "score": 0-100,
+  "first_case_index": 0-100 (首案指数),
+  "influence_level": "行业级/区域级/个案级",
+  "analysis": "判例价值分析（150字以内）",
+  "key_points": ["价值点1", "价值点2"]
+}}
+
+只返回 JSON。"""
+
+    return _call_llm(
+        "你是知识产权领域专家，擅长判例价值评估。请严格按 JSON 格式返回。",
+        prompt, 0.2
+    )
+
+
+# ============================================================
+# 维度三：证据就绪度
+# ============================================================
+
+def evaluate_evidence_readiness(
+    case_description: str,
+    uploaded_evidence_texts: str = "",
+    evidence_count: int = 0
+) -> Dict:
+    """
+    维度三：证据就绪度评估
+    对照商标侵权标准取证清单，检查证据完整性
+    """
+    prompt = f"""你是知识产权证据审查专家。请评估案件证据的就绪程度。
+
+## 案情
+{case_description[:2000]}
+
+## 已上传证据材料
+{uploaded_evidence_texts[:3000] if uploaded_evidence_texts else "未上传证据文件（仅凭案情描述分析）"}
+已上传文件数: {evidence_count}
+
+## 评估框架（商标侵权标准取证清单）
+逐项检查以下证据是否满足：
+1. 权利基础证据：商标注册证/续展证明/使用证据（防撤三）
+2. 侵权认定证据：侵权截图/购买取证/公证文书
+3. 损害赔偿证据：被告获利/原告损失/许可费/侵权规模
+4. 取证技术建议：可信时间戳/区块链存证/公证取证
+
+## 返回格式（严格 JSON）
+{{
+  "score": 0-100,
+  "evidence_matrix": [
+    {{
+      "requirement": "要件名",
+      "standard_evidence": "标准证据",
+      "status": "充足/不足/缺失",
+      "analysis": "分析"
+    }}
+  ],
+  "analysis": "整体证据评估",
+  "missing_items": ["缺失项1"],
+  "remediation_suggestions": ["补证建议1"],
+  "collection_advice": "取证技术建议"
+}}
+
+只返回 JSON。"""
+
+    return _call_llm(
+        "你是知识产权证据审查专家。请严格按 JSON 格式返回。",
+        prompt, 0.2
+    )
 
 
 # ============================================================
@@ -218,10 +412,7 @@ def analyze_legal_elements_real(case_facts: Dict) -> Dict[str, Any]:
 def check_api_connection() -> bool:
     """检查 DeepSeek API 连接"""
     try:
-        _call_deepseek([
-            {"role": "user", "content": "回复 OK"}
-        ], temperature=0)
+        _call_llm("回复 OK", "回复 OK")
         return True
-    except Exception as e:
-        print(f"API 连接失败: {e}")
+    except Exception:
         return False
