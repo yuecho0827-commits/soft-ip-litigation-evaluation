@@ -76,15 +76,15 @@ def ocr_image(image_bytes: bytes, filename: str) -> Dict:
             "success": False,
             "text": "",
             "filename": filename,
-            "error": "Tesseract 未安装。macOS: brew install tesseract tesseract-lang"
+            "error": "Tesseract 未安装。\n\n本地环境：\n  macOS: brew install --build-from-source tesseract\n  或: conda install -c conda-forge tesseract\n\nStreamlit Cloud 上自动可用，无需安装。"
         }
     except pytesseract.pytesseract.TesseractError as e:
-        if "chi_sim" in str(e):
+        if "chi_sim" in str(e) or "traineddata" in str(e):
             return {
                 "success": False,
                 "text": "",
                 "filename": filename,
-                "error": "缺少中文语言包。macOS: brew install tesseract-lang"
+                "error": "缺少中文语言包。\n\n本地环境：\n  brew install tesseract-lang\n\n或使用英文模式：\n  brew install tesseract\n\nStreamlit Cloud 上自动可用。"
             }
         return {
             "success": False,
