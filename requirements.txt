@@ -2,5 +2,6 @@ streamlit>=1.30.0
 sqlalchemy>=2.0.0
 reportlab>=4.0.0
 pymupdf>=1.24.0
-pytesseract>=0.3.10
+numpy>=1.24.0
 Pillow>=10.0.0
+
