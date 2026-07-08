@@ -14,7 +14,7 @@ from datetime import datetime
 # 添加项目根目录到 Python 路径
 sys.path.append(str(Path(__file__).parent))
 
-from config import APP_TITLE, APP_VERSION, USE_MOCK
+from config import APP_TITLE, APP_VERSION, USE_MOCK, DEEPSEEK_API_KEY
 from database import init_db, SessionLocal, Case, RuleHit, ScoreSnapshot, Report
 if USE_MOCK:
     from mock_llm import extract_case_facts, analyze_legal_elements
@@ -23,7 +23,8 @@ else:
     from llm_client import analyze_legal_elements_real as analyze_legal_elements
 from legal_rules import run_rule_engine
 from scoring import run_scoring
-from report_generator import generate_markdown_report, generate_pdf_bytes, generate_pdf_bytes
+from report_generator import generate_markdown_report, generate_pdf_bytes
+from evidence_parser import parse_pdf, ocr_image, is_pdf_file, is_image_file, generate_pdf_bytes
 
 # 页面配置
 st.set_page_config(
@@ -174,7 +175,78 @@ st.sidebar.caption("© 2026 Soft IP Evaluation")
 # ============================================================
 if page == "📝 新建案件":
     st.markdown("<h1 style='color:#1a1a1a;font-size:2rem;font-weight:bold;'>📝 新建商标侵权案件</h1>", unsafe_allow_html=True)
-    st.caption("填写案件基本信息，开始诉前评估")
+    st.caption("上传证据文件 + 填写案情描述，开始诉前评估")
+
+    # ── 文件上传区（form 外部，自动解析）──
+    st.markdown("### 📎 上传证据文件")
+    uploaded_files = st.file_uploader(
+        "支持 PDF（自动提取文本）和图片（OCR识别文字）",
+        type=["pdf", "png", "jpg", "jpeg"],
+        accept_multiple_files=True,
+        key="evidence_uploader",
+        help="上传商标注册证、侵权截图、公证文书等证据文件"
+    )
+
+    parsed_evidences = []
+    if uploaded_files:
+        for f in uploaded_files:
+            # 避免重复解析同一个文件
+            cache_key = f"parsed_{f.name}_{f.size}"
+            if cache_key not in st.session_state:
+                with st.spinner(f"🔍 正在解析 {f.name} ..."):
+                    file_bytes = f.getvalue()
+                    if is_pdf_file(f.name):
+                        result = parse_pdf(file_bytes, f.name)
+                    elif is_image_file(f.name):
+                        result = ocr_image(file_bytes, f.name, DEEPSEEK_API_KEY)
+                    else:
+                        result = {"success": False, "text": "", "error": "不支持的文件格式"}
+
+                    # 截取前 3000 字
+                    if result["success"] and len(result["text"]) > 3000:
+                        result["text"] = result["text"][:3000] + "\n\n... (文本过长，已截取)"
+
+                    st.session_state[cache_key] = result
+
+            parsed = st.session_state[cache_key]
+            parsed_evidences.append((f.name, f.size, parsed))
+
+    # 展示解析结果
+    if parsed_evidences:
+        st.markdown("**解析结果：**")
+        for fname, fsize, result in parsed_evidences:
+            icon = "✅" if result["success"] else "❌"
+            if result["success"]:
+                text_len = len(result["text"])
+                with st.expander(f"{icon} {fname} ({text_len} 字)"):
+                    st.text_area(
+                        f"内容 - {fname}",
+                        value=result["text"],
+                        height=200,
+                        key=f"preview_{fname}",
+                        label_visibility="collapsed"
+                    )
+                    col_btn1, col_btn2 = st.columns([1, 3])
+                    with col_btn1:
+                        if st.button(f"📋 追加到案情", key=f"append_{hash(fname)}", use_container_width=True):
+                            current_extra = st.session_state.get("evidence_text_extra", "")
+                            st.session_state["evidence_text_extra"] = current_extra + f"\n\n【证据文件: {fname}】\n{result['text']}"
+                            st.rerun()
+            else:
+                st.warning(f"{icon} {fname}: {result['error']}")
+
+        st.divider()
+
+    # 补充文本（来自追加按钮）
+    evidence_extra = st.session_state.get("evidence_text_extra", "")
+    if evidence_extra:
+        st.success(f"📋 已追加 {len(evidence_extra)} 字证据文本到案情描述")
+        if st.button("🗑️ 清除已追加的证据文本", type="secondary"):
+            st.session_state["evidence_text_extra"] = ""
+            st.rerun()
+
+    # ── 表单 ──
+    default_desc = st.session_state.get("last_case_desc", "")
 
     with st.form("new_case_form"):
         col1, col2 = st.columns(2)
@@ -184,15 +256,19 @@ if page == "📝 新建案件":
             goal_type = st.radio("业务目标", ["要钱", "要名"], horizontal=True)
         with col2:
             client_org = st.text_input("委托客户", placeholder="例如：某知名品牌公司")
+            # 预设值为用户手动输入 + 追加的证据文本
+            prefill = (evidence_extra + "\n\n" + default_desc).strip()
             case_description = st.text_area(
                 "案情描述 *", height=300,
+                value=prefill,
                 placeholder="请详细描述案情，包括：\n- 原告商标信息（注册号、类别、有效期）\n- 被告侵权行为（何时发现、如何侵权）\n- 侵权商品销售情况\n- 已收集的证据"
             )
 
         submitted = st.form_submit_button("创建案件并开始评估", type="primary", use_container_width=True)
 
         if submitted:
-            if not case_name or not case_description.strip():
+            full_desc = case_description.strip()
+            if not case_name or not full_desc:
                 st.error("请填写必填项（案件名称、案情描述）")
             else:
                 db = SessionLocal()
@@ -200,13 +276,15 @@ if page == "📝 新建案件":
                     new_case = Case(
                         name=case_name, cause_type="商标侵权",
                         goal_type=goal_type, client_org=client_org or "",
-                        case_description=case_description, status="draft"
+                        case_description=full_desc, status="draft"
                     )
                     db.add(new_case)
                     db.commit()
                     db.refresh(new_case)
                     st.session_state["current_case_id"] = new_case.id
                     st.session_state["current_case_name"] = new_case.name
+                    st.session_state["last_case_desc"] = full_desc
+                    st.session_state["evidence_text_extra"] = ""
                     st.session_state["nav_target"] = "🔍 评估分析"
                     st.rerun()
                 except Exception as e:
