@@ -50,6 +50,9 @@ from scoring import (
     generate_recommendation,
 )
 from legal_database import format_laws_for_report, format_cases_for_report
+from pkulaw_integration import (
+    generate_all_queries, load_results, get_validation_status, get_dimension_results
+)
 
 # 页面配置
 st.set_page_config(
@@ -450,6 +453,17 @@ elif page == "🔍 评估分析":
                              sub_items=sub_scores,
                              extra="优势: " + ", ".join(rights_result.get('strengths', ['-'])) + "\n\n风险: " + ", ".join(rights_result.get('risks', ['-'])))
 
+                # ── 北大法宝：权利基础法条检索 ──
+                with st.expander("📚 北大法宝 · 法条检索（验证权利基础）", expanded=False):
+                    st.caption("检索商标法核心法条 + 驰名商标认定规定")
+                    pkulaw_rights = get_dimension_results(case_id, "1.1_权利基础")
+                    if pkulaw_rights:
+                        for law in pkulaw_rights.get("laws", [])[:3]:
+                            st.markdown(f"**{law.get('title', law.get('name',''))}**")
+                            st.caption(law.get('content', law.get('text',''))[:300])
+                    else:
+                        st.info("⚠️ 尚未检索。评估完成后，让 AI 助手通过北大法宝检索验证。")
+
                 # 1.2 侵权认定
                 progress.progress(22, "2/7 侵权认定评估...")
                 with st.spinner("DeepSeek 正在分析商标侵权五要件（商标性使用、商品类似性、近似性、混淆可能性、正当使用）..."):
@@ -466,6 +480,17 @@ elif page == "🔍 评估分析":
                              infringement_result.get('analysis', ''),
                              sub_items=el_items)
 
+                # ── 北大法宝：侵权认定类案检索 ──
+                with st.expander("📚 北大法宝 · 类案检索（验证侵权认定标准）", expanded=False):
+                    st.caption("检索近似商标/混淆可能性类案判决")
+                    pkulaw_inf = get_dimension_results(case_id, "1.2_侵权认定")
+                    if pkulaw_inf:
+                        for c in pkulaw_inf.get("cases", [])[:3]:
+                            st.markdown(f"**{c.get('title', c.get('name',''))}**")
+                            st.caption(f"{c.get('court','')} | {c.get('date','')}")
+                    else:
+                        st.info("⚠️ 尚未检索。评估完成后，让 AI 助手通过北大法宝检索验证。")
+
                 # 1.3 诉讼程序
                 progress.progress(36, "3/7 程序审查...")
                 with st.spinner("DeepSeek 正在审查诉讼时效、管辖仲裁、主体适格、前置程序..."):
@@ -477,6 +502,17 @@ elif page == "🔍 评估分析":
                     dim_card("1.3 诉讼程序审查", procedure_result.get('score', 0),
                              procedure_result.get('analysis', ''),
                              sub_items=proc_items)
+
+                # ── 北大法宝：程序法条检索 ──
+                with st.expander("📚 北大法宝 · 法条检索（验证诉讼程序依据）", expanded=False):
+                    st.caption("检索诉讼时效、管辖、主体适格相关法条")
+                    pkulaw_proc = get_dimension_results(case_id, "1.3_诉讼程序")
+                    if pkulaw_proc:
+                        for law in pkulaw_proc.get("laws", [])[:3]:
+                            st.markdown(f"**{law.get('title', law.get('name',''))}**")
+                            st.caption(law.get('content', law.get('text',''))[:300])
+                    else:
+                        st.info("⚠️ 尚未检索。评估完成后，让 AI 助手通过北大法宝检索验证。")
 
                 # 1.4 模拟法庭
                 progress.progress(50, "4/7 模拟法庭对抗检验...")
@@ -542,7 +578,17 @@ elif page == "🔍 评估分析":
                     prec_score = precedent_result.get('score', 50)
                     dim_card("2.2 判例价值评估", prec_score, precedent_result.get('analysis', ''),
                              extra=f"首案指数: {precedent_result.get('first_case_index','-')} | 影响力级别: {precedent_result.get('influence_level','-')}")
-                    st.caption("💡 评估完成后可让 AI 助手通过北大法宝检索同类在先判决，校准首案指数")
+
+                # ── 北大法宝：判例价值类案检索（主力引擎）──
+                with st.expander("📚 北大法宝 · 首案检索（判例价值主力引擎）", expanded=True):
+                    st.caption("检索同类在先判决，判断首案潜力 + 指导性案例入选概率")
+                    pkulaw_prec = get_dimension_results(case_id, "2.2_判例价值")
+                    if pkulaw_prec:
+                        for c in pkulaw_prec.get("cases", [])[:5]:
+                            st.markdown(f"**{c.get('title', c.get('name',''))}**")
+                            st.caption(f"{c.get('court','')} | {c.get('date','')} | {c.get('summary','')[:150] if c.get('summary') else ''}")
+                    else:
+                        st.info("⚠️ 尚未检索。评估完成后，让 AI 助手通过北大法宝检索同类在先判决。")
 
                 # ── 维度二小计 ──
                 business_score = calculate_business_expectation(fin_score, prec_score, case.goal_type)
@@ -626,6 +672,21 @@ elif page == "🔍 评估分析":
                     })
                     st.markdown(radar_html, unsafe_allow_html=True)
 
+                # ── 北大法宝：法条与案号验证 ──
+                st.markdown("---")
+                with st.expander("🔍 北大法宝 · 法条与案号验证（防止 AI 生成虚假法条/案件）", expanded=False):
+                    st.caption("运行 adjust_provisions / law_recognition / anhao_recognition 三大验证")
+                    valid_status = get_validation_status(case_id)
+                    col_v1, col_v2, col_v3 = st.columns(3)
+                    with col_v1:
+                        st.metric("法条验证", "✅ 通过" if valid_status["provisions_validated"] else "⏳ 待验证")
+                    with col_v2:
+                        st.metric("法规识别", "✅ 通过" if valid_status["laws_validated"] else "⏳ 待验证")
+                    with col_v3:
+                        st.metric("案号识别", "✅ 通过" if valid_status["cases_validated"] else "⏳ 待验证")
+                    if not all([valid_status["provisions_validated"], valid_status["laws_validated"], valid_status["cases_validated"]]):
+                        st.warning("⚠️ 评估完成后，请让 AI 助手运行北大法宝验证，确保法条和案号引用真实有效")
+
                 # 保存
                 db.add(ScoreSnapshot(case_id=case_id, legal_score=legal_score, business_score=business_score,
                     evidence_score=evidence_score, confidence_score=70, final_score=final_score, recommendation=rec['recommendation']))
@@ -654,8 +715,17 @@ elif page == "🔍 评估分析":
                 case.status = "completed"
                 db.commit()
 
+                # 生成北大法宝检索计划
+                deepseek_results = {
+                    "rights": rights_result, "infringement": infringement_result,
+                    "procedure": procedure_result, "financial": financial_result,
+                    "precedent": precedent_result, "evidence": evidence_result
+                }
+                generate_all_queries(case_id, case.case_description, deepseek_results)
+
                 progress.progress(100, "评估完成！")
                 st.success("🎉 三维评估全部完成！请前往「评估报告」查看下载")
+                st.info("📚 北大法宝检索计划已生成。回复'帮我检索案件 [ID]'让 AI 助手完成法律数据库查询。")
                 st.balloons()
 
     finally:
