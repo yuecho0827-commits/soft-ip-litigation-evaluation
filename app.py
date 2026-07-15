@@ -27,7 +27,8 @@ if USE_MOCK:
         check_rules as evaluate_procedure,
         generate_score as evaluate_financial_return,
         generate_report as evaluate_precedent_value,
-        run_moot_court as run_moot_court_simulation,
+        evaluate_evidence_readiness,
+        run_moot_court_simulation,
     )
     _mock = True
 else:
@@ -38,8 +39,8 @@ else:
         evaluate_financial_return,
         evaluate_precedent_value,
         evaluate_evidence_readiness,
-        run_moot_court_simulation,
     )
+    from moot_court import run_moot_court as run_moot_court_simulation
     _mock = False
 
 from legal_rules import run_rule_engine
@@ -179,7 +180,7 @@ def render_score_bar(label, score, color):
 st.sidebar.title("⚖️ Soft IP 评估系统")
 st.sidebar.caption(f"版本: {APP_VERSION}")
 
-page_options = ["📝 新建案件", "📊 案件列表", "🔍 评估分析", "📄 评估报告", "ℹ️ 关于"]
+page_options = ["📝 新建案件", "📊 案件列表", "🔍 评估分析", "⚖️ 模拟法庭", "📄 评估报告", "ℹ️ 关于"]
 
 if "nav_page" not in st.session_state:
     st.session_state.nav_page = "📝 新建案件"
@@ -514,22 +515,116 @@ elif page == "🔍 评估分析":
                     else:
                         st.info("⚠️ 尚未检索。评估完成后，让 AI 助手通过北大法宝检索验证。")
 
-                # 1.4 模拟法庭
+                # 1.4 模拟法庭（多Agent五步庭审）
                 progress.progress(50, "4/7 模拟法庭对抗检验...")
-                with st.spinner("DeepSeek 正在进行五步庭审模拟（原告陈述→被告答辩→质证→辩论→法官归纳）..."):
+                st.markdown("""<div style="background:linear-gradient(135deg,#fdebd0 0%,#fdf2e9 100%);
+                            border-radius:10px;padding:14px 20px;margin:16px 0 12px 0;border-left:4px solid #e67e22;">
+                            <span style="font-size:1.1rem;font-weight:bold;color:#7e5109;">⚖️ 1.4 模拟法庭（多Agent对抗检验）</span>
+                            <span style="color:#888;margin-left:8px;font-size:0.85rem;">原告Agent ↔ 被告Agent ↔ 法官Agent</span></div>""", unsafe_allow_html=True)
+
+                mode_label = "Mock 模拟" if _mock else "DeepSeek API"
+                with st.spinner(f"正在进行五步庭审模拟（{mode_label}）：开庭陈述 → 被告答辩 → 举证质证 → 法庭辩论 → 法官归纳..."):
                     moot_result = run_moot_court_simulation(case.case_description,
                         rights_assessment=str(rights_result.get('analysis', '')),
                         infringement_assessment=str(infringement_result.get('analysis', '')),
                         evidence_summary=evidence_texts[:1500] if evidence_texts else "")
-                if "error" in moot_result:
-                    st.warning(f"模拟法庭异常: {moot_result.get('error', moot_result.get('raw',''))[:200]}")
+
+                if moot_result.get("error") and not moot_result.get("rounds"):
+                    st.warning(f"模拟法庭异常: {moot_result.get('error', '')[:200]}")
                     correction_coeff = 1.0
                 else:
                     correction_coeff = moot_result.get('correction_coefficient', 1.0)
-                    moot_items = [{"name": rnd['role'], "status": "pass", "detail": rnd['content'][:300] + "..."} for rnd in moot_result.get('rounds', [])]
-                    dim_card("1.4 模拟法庭（对抗检验）", int(correction_coeff * 100),
-                             f"对抗修正系数: {correction_coeff:.2f} | 法官归纳: {moot_result.get('judge_summary', '')[:200]}",
-                             sub_items=moot_items)
+                    defense_strength = moot_result.get('defense_strength', 50)
+
+                    # 修正系数 + 抗辩强度概览
+                    coeff_color = "#e74c3c" if correction_coeff < 0.9 else "#f39c12" if correction_coeff < 1.0 else "#2ecc71"
+                    st.markdown(f"""<div style="display:flex;gap:16px;margin:12px 0;">
+                        <div style="flex:1;background:#fff;border:1px solid #e0e0e0;border-radius:8px;padding:16px;text-align:center;">
+                            <div style="font-size:0.8rem;color:#999;">对抗修正系数</div>
+                            <div style="font-size:2rem;font-weight:bold;color:{coeff_color};">{correction_coeff:.2f}</div>
+                            <div style="font-size:0.75rem;color:#999;">{'被告抗辩有效削弱原告论证' if correction_coeff < 1.0 else '原告论证在对抗中成立'}</div>
+                        </div>
+                        <div style="flex:1;background:#fff;border:1px solid #e0e0e0;border-radius:8px;padding:16px;text-align:center;">
+                            <div style="font-size:0.8rem;color:#999;">被告抗辩强度</div>
+                            <div style="font-size:2rem;font-weight:bold;color:#e67e22;">{defense_strength}<span style="font-size:1rem;color:#999;">/100</span></div>
+                            <div style="font-size:0.75rem;color:#999;">{'抗辩有力' if defense_strength >= 60 else '抗辩一般' if defense_strength >= 40 else '抗辩薄弱'}</div>
+                        </div>
+                    </div>""", unsafe_allow_html=True)
+
+                    # 庭审对话记录（可展开）
+                    rounds = moot_result.get('rounds', [])
+                    if rounds:
+                        with st.expander(f"📜 庭审记录（共{len(rounds)}轮发言）", expanded=False):
+                            for rnd in rounds:
+                                role = rnd.get('role', rnd.get('speaker', ''))
+                                role_name = rnd.get('role_name', role)
+                                step_name = rnd.get('step_name', '')
+                                content = rnd.get('content', '')
+
+                                # 角色颜色
+                                if 'plaintiff' in str(role) or '原告' in str(role_name):
+                                    color = "#2c7be5"
+                                    icon = "🔵"
+                                elif 'defendant' in str(role) or '被告' in str(role_name):
+                                    color = "#e74c3c"
+                                    icon = "🔴"
+                                else:
+                                    color = "#8e44ad"
+                                    icon = "⚖️"
+
+                                st.markdown(f"""<div style="border-left:3px solid {color};padding:8px 16px;margin:8px 0;background:#f8f9fa;border-radius:0 6px 6px 0;">
+                                    <div style="font-weight:bold;color:{color};font-size:0.9rem;">{icon} {role_name}
+                                    <span style="color:#999;font-weight:normal;font-size:0.8rem;margin-left:8px;">{step_name}</span></div>
+                                    <div style="font-size:0.85rem;color:#444;margin-top:6px;line-height:1.6;white-space:pre-wrap;">{content[:800]}{'...' if len(content)>800 else ''}</div>
+                                </div>""", unsafe_allow_html=True)
+
+                    # 法官评分（如有）
+                    judge_scores = moot_result.get('judge_scores', {})
+                    if judge_scores and judge_scores.get('plaintiff'):
+                        with st.expander("📊 法官评分明细", expanded=False):
+                            p_scores = judge_scores.get('plaintiff', {})
+                            d_scores = judge_scores.get('defendant', {})
+                            p_detail = judge_scores.get('plaintiff_detail', {})
+                            d_detail = judge_scores.get('defendant_detail', {})
+
+                            col_p, col_d = st.columns(2)
+                            with col_p:
+                                st.markdown("**🔵 原告论证强度**")
+                                label_map = {
+                                    "rights": "权利基础", "infringement": "侵权认定",
+                                    "evidence": "证据体系", "legal_application": "法律适用",
+                                    "claim_reasonableness": "诉求合理性"
+                                }
+                                for k, v in p_scores.items():
+                                    label = label_map.get(k, k)
+                                    detail = p_detail.get(k, "")
+                                    st.markdown(f"• **{label}**: {v} 分 — {detail}" if detail else f"• **{label}**: {v} 分")
+
+                            with col_d:
+                                st.markdown("**🔴 被告抗辩强度**")
+                                d_label_map = {
+                                    "fact_defense": "事实抗辩", "legal_defense": "法律抗辩",
+                                    "evidence_challenge": "证据质疑", "alternative_explanation": "替代解释",
+                                    "procedural_defense": "程序抗辩"
+                                }
+                                for k, v in d_scores.items():
+                                    label = d_label_map.get(k, k)
+                                    detail = d_detail.get(k, "")
+                                    st.markdown(f"• **{label}**: {v} 分 — {detail}" if detail else f"• **{label}**: {v} 分")
+
+                            reasoning = judge_scores.get('coefficient_reasoning', '')
+                            if reasoning:
+                                st.info(f"📝 **修正系数推理**: {reasoning}")
+
+                    # 薄弱环节
+                    weak_points = moot_result.get('weak_points', [])
+                    if weak_points:
+                        st.markdown("**⚠️ 对抗暴露的薄弱环节:**")
+                        for wp in weak_points:
+                            st.markdown(f"- {wp}")
+
+                    # 提示可前往独立页面查看完整记录
+                    st.caption("💡 前往「模拟法庭」页面可查看完整庭审记录和交互式回放")
 
                 # ── 维度一小计 ──
                 legal_score = calculate_legal_feasibility(
@@ -732,7 +827,232 @@ elif page == "🔍 评估分析":
         db.close()
 
 # ============================================================
-# 页面 4: 评估报告（含三维可视化 + 可下载总结文档）
+# 页面: 模拟法庭（多Agent对抗式庭审）
+# ============================================================
+elif page == "⚖️ 模拟法庭":
+    st.markdown("<h1 style='color:#1a1a1a;font-size:2rem;font-weight:bold;'>⚖️ 模拟法庭</h1>", unsafe_allow_html=True)
+    st.caption("多Agent对抗式庭审模拟 — 原告Agent ↔ 被告Agent ↔ 法官Agent")
+
+    if "current_case_id" not in st.session_state:
+        st.warning("请先在「案件列表」中选择一个案件")
+        st.stop()
+
+    case_id = st.session_state["current_case_id"]
+    case_name = st.session_state.get("current_case_name", "未知案件")
+
+    db = SessionLocal()
+    try:
+        case = db.query(Case).filter(Case.id == case_id).first()
+        if not case:
+            st.error("案件不存在")
+            st.stop()
+
+        st.markdown(f"**当前案件:** {case_name}  |  ID: {case_id}  |  案由: {case.cause_type}")
+        st.caption(f"运行模式: {'Mock 模拟' if _mock else 'DeepSeek API'}")
+
+        # 检查是否已有模拟法庭结果
+        moot_key = f"moot_{case_id}"
+        moot_result = st.session_state.get(moot_key)
+
+        # ── 操作区 ──
+        col_run, col_info = st.columns([1, 2])
+        with col_run:
+            if st.button("🚀 开始模拟法庭", type="primary", use_container_width=True):
+                # 获取评估结果作为原告Agent的输入
+                rights_key = f"rights_{case_id}"
+                inf_key = f"infringement_{case_id}"
+                rights_text = str(st.session_state.get(rights_key, {}).get('analysis', ''))
+                inf_text = str(st.session_state.get(inf_key, {}).get('analysis', ''))
+                evidence_texts = st.session_state.get("evidence_text_extra", "")
+
+                progress = st.progress(0, "正在启动模拟法庭...")
+                steps_labels = [
+                    "开庭陈述（原告）",
+                    "被告答辩",
+                    "举证质证（原告→被告）",
+                    "法庭辩论（原告→被告）",
+                    "法官归纳"
+                ]
+
+                with st.spinner("正在运行五步庭审模拟，预计需要 1-2 分钟..."):
+                    moot_result = run_moot_court_simulation(
+                        case.case_description,
+                        rights_assessment=rights_text,
+                        infringement_assessment=inf_text,
+                        evidence_summary=evidence_texts[:1500] if evidence_texts else ""
+                    )
+                    st.session_state[moot_key] = moot_result
+
+                progress.progress(100, "模拟法庭完成！")
+                st.rerun()
+
+        with col_info:
+            if moot_result:
+                coeff = moot_result.get('correction_coefficient', 1.0)
+                st.success(f"✅ 已完成模拟法庭 | 对抗修正系数: **{coeff:.2f}** | 被告抗辩强度: **{moot_result.get('defense_strength', 50)}/100**")
+            else:
+                st.info("点击上方按钮启动模拟法庭。需要先完成「评估分析」以获取权利基础和侵权认定结果。")
+
+        st.divider()
+
+        # ── 庭审记录展示 ──
+        if moot_result and moot_result.get('rounds'):
+            rounds = moot_result.get('rounds', [])
+
+            # 三栏布局：左侧步骤导航 | 中央对话面板 | 右侧评分摘要
+            col_nav, col_dialog, col_scores = st.columns([1, 3, 1])
+
+            # ── 左侧：步骤导航 ──
+            with col_nav:
+                st.markdown("#### 庭审流程")
+                step_groups = {}
+                for r in rounds:
+                    s = r.get('step', 0)
+                    if s not in step_groups:
+                        step_groups[s] = []
+                    step_groups[s].append(r)
+
+                step_icons = {1: "1️⃣", 2: "2️⃣", 3: "3️⃣", 4: "4️⃣", 5: "5️⃣"}
+                step_names_full = {
+                    1: "开庭陈述",
+                    2: "被告答辩",
+                    3: "举证质证",
+                    4: "法庭辩论",
+                    5: "法官归纳"
+                }
+
+                for step_num in sorted(step_groups.keys()):
+                    icon = step_icons.get(step_num, "  ")
+                    name = step_names_full.get(step_num, "")
+                    count = len(step_groups[step_num])
+                    st.markdown(f"**{icon} {name}**")
+                    st.caption(f"  {count} 轮发言 ✅")
+                    if step_num < 5:
+                        st.markdown("  ↓")
+
+                st.divider()
+                coeff = moot_result.get('correction_coefficient', 1.0)
+                coeff_color = "#e74c3c" if coeff < 0.9 else "#f39c12" if coeff < 1.0 else "#2ecc71"
+                st.markdown(f"""<div style="text-align:center;padding:12px;background:{coeff_color}15;border-radius:8px;">
+                    <div style="font-size:0.75rem;color:#999;">修正系数</div>
+                    <div style="font-size:1.8rem;font-weight:bold;color:{coeff_color};">{coeff:.2f}</div>
+                </div>""", unsafe_allow_html=True)
+
+            # ── 中央：对话面板 ──
+            with col_dialog:
+                st.markdown("#### 庭审记录")
+                for rnd in rounds:
+                    role = rnd.get('role', rnd.get('speaker', ''))
+                    role_name = rnd.get('role_name', role)
+                    step_name = rnd.get('step_name', '')
+                    content = rnd.get('content', '')
+
+                    # 角色颜色和图标
+                    if 'plaintiff' in str(role) or '原告' in str(role_name):
+                        color = "#2c7be5"
+                        bg = "#ebf3fc"
+                        icon = "🔵"
+                        align = "left"
+                    elif 'defendant' in str(role) or '被告' in str(role_name):
+                        color = "#e74c3c"
+                        bg = "#fdf0ef"
+                        icon = "🔴"
+                        align = "right"
+                    else:
+                        color = "#8e44ad"
+                        bg = "#f5eef8"
+                        icon = "⚖️"
+                        align = "center"
+
+                    if align == "right":
+                        margin = "margin-left:15%;"
+                    elif align == "center":
+                        margin = "margin:0 8%;"
+                    else:
+                        margin = "margin-right:15%;"
+
+                    st.markdown(f"""<div style="background:{bg};border:1px solid {color}30;border-radius:12px;
+                        padding:16px 20px;margin:10px 0;{margin}">
+                        <div style="font-weight:bold;color:{color};font-size:0.9rem;margin-bottom:8px;">
+                            {icon} {role_name}
+                            <span style="color:#aaa;font-weight:normal;font-size:0.78rem;margin-left:8px;">{step_name}</span>
+                        </div>
+                        <div style="font-size:0.85rem;color:#333;line-height:1.7;white-space:pre-wrap;">{content}</div>
+                    </div>""", unsafe_allow_html=True)
+
+            # ── 右侧：评分摘要 ──
+            with col_scores:
+                st.markdown("#### 法官评分")
+
+                judge_scores = moot_result.get('judge_scores', {})
+                if judge_scores and judge_scores.get('plaintiff'):
+                    p_scores = judge_scores.get('plaintiff', {})
+                    d_scores = judge_scores.get('defendant', {})
+
+                    st.markdown("**🔵 原告**")
+                    p_labels = {"rights": "权利基础", "infringement": "侵权认定",
+                                "evidence": "证据体系", "legal_application": "法律适用",
+                                "claim_reasonableness": "诉求合理"}
+                    for k, v in p_scores.items():
+                        bar_c = "#2ecc71" if v >= 70 else "#f39c12" if v >= 50 else "#e74c3c"
+                        st.markdown(f"""<div style="margin-bottom:6px;">
+                            <div style="font-size:0.75rem;color:#666;">{p_labels.get(k, k)}</div>
+                            <div style="display:flex;align-items:center;gap:4px;">
+                                <div style="flex:1;height:6px;background:#eee;border-radius:3px;overflow:hidden;">
+                                    <div style="height:100%;width:{v}%;background:{bar_c};border-radius:3px;"></div>
+                                </div>
+                                <span style="font-size:0.75rem;font-weight:bold;color:{bar_c};">{v}</span>
+                            </div>
+                        </div>""", unsafe_allow_html=True)
+
+                    st.markdown("---")
+                    st.markdown("**🔴 被告**")
+                    d_labels = {"fact_defense": "事实抗辩", "legal_defense": "法律抗辩",
+                                "evidence_challenge": "证据质疑", "alternative_explanation": "替代解释",
+                                "procedural_defense": "程序抗辩"}
+                    for k, v in d_scores.items():
+                        bar_c = "#2ecc71" if v >= 70 else "#f39c12" if v >= 50 else "#e74c3c"
+                        st.markdown(f"""<div style="margin-bottom:6px;">
+                            <div style="font-size:0.75rem;color:#666;">{d_labels.get(k, k)}</div>
+                            <div style="display:flex;align-items:center;gap:4px;">
+                                <div style="flex:1;height:6px;background:#eee;border-radius:3px;overflow:hidden;">
+                                    <div style="height:100%;width:{v}%;background:{bar_c};border-radius:3px;"></div>
+                                </div>
+                                <span style="font-size:0.75rem;font-weight:bold;color:{bar_c};">{v}</span>
+                            </div>
+                        </div>""", unsafe_allow_html=True)
+                else:
+                    st.caption("（评分数据不可用）")
+
+                st.divider()
+                st.markdown(f"**被告抗辩强度**")
+                ds = moot_result.get('defense_strength', 50)
+                st.markdown(f"<div style='font-size:2rem;font-weight:bold;color:#e67e22;'>{ds}<span style='font-size:0.9rem;color:#999;'>/100</span></div>", unsafe_allow_html=True)
+
+                # 薄弱环节
+                weak_points = moot_result.get('weak_points', [])
+                if weak_points:
+                    st.divider()
+                    st.markdown("**⚠️ 薄弱环节**")
+                    for wp in weak_points:
+                        st.markdown(f"<div style='font-size:0.78rem;color:#666;margin-bottom:4px;'>• {wp}</div>", unsafe_allow_html=True)
+
+                # 争议焦点
+                focus_points = moot_result.get('focus_points', [])
+                if focus_points:
+                    st.divider()
+                    st.markdown("**🎯 争议焦点**")
+                    for i, fp in enumerate(focus_points, 1):
+                        st.markdown(f"<div style='font-size:0.78rem;color:#666;margin-bottom:4px;'>{i}. {fp}</div>", unsafe_allow_html=True)
+
+        elif moot_result and moot_result.get('error'):
+            st.error(f"模拟法庭出错: {moot_result['error']}")
+
+    finally:
+        db.close()
+
+# ============================================================
+# 页面: 评估报告（含三维可视化 + 可下载总结文档）
 # ============================================================
 elif page == "📄 评估报告":
     st.markdown("<h1 style='color:#1a1a1a;font-size:2rem;font-weight:bold;'>📄 评估报告</h1>", unsafe_allow_html=True)
@@ -950,13 +1270,13 @@ elif page == "ℹ️ 关于":
     - ✅ 三维雷达可视化
     - ✅ 评估报告生成（Markdown + 总结文档下载）
     - ✅ Mock 模式（无需 API Key）
+    - ✅ 模拟法庭（多Agent对抗式庭审：原告↔被告↔法官，五步庭审流程）
 
     **后续规划**:
-    - 🔜 接入 DeepSeek API，替换 Mock 模式
-    - 🔜 接入法律数据库（法规、案例检索）
-    - 🔜 模拟法庭（多 Agent 对抗推演）
+    - 🔜 接入法律数据库（法规、案例检索）自动化闭环
     - 🔜 著作权、不正当竞争案由扩展
     - 🔜 证据文件上传与自动解析
+    - 🔜 模拟法庭用户介入功能（暂停修改论证）
 
     **技术栈**:
     - 前端: Streamlit
