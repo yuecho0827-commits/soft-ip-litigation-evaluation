@@ -61,6 +61,33 @@ def inject_global_css():
         color: #0d1429;
     }
 
+    /* ── 锁定整页 — 禁止任何外层滚动，仅输入框内部可滚 ── */
+    html, body {
+        overflow: hidden !important;
+        height: 100vh !important;
+    }
+    [data-testid="stAppViewContainer"],
+    [data-testid="stApp"],
+    .stApp {
+        height: 100vh !important;
+        max-height: 100vh !important;
+        overflow: hidden !important;
+    }
+    [data-testid="stAppViewContainer"] > section.main,
+    section.main,
+    .main {
+        height: 100vh !important;
+        max-height: 100vh !important;
+        overflow: hidden !important;
+    }
+    [data-testid="stAppViewContainer"] .block-container,
+    .block-container {
+        height: calc(100vh - 4rem) !important;
+        max-height: calc(100vh - 4rem) !important;
+        overflow: hidden !important;
+        padding-bottom: 1rem !important;
+    }
+
     /* ── 噪点纹理覆盖层 ── */
     .stApp::before {
         content: "";
@@ -100,40 +127,6 @@ def inject_global_css():
     section[data-testid="stSidebar"] h2,
     section[data-testid="stSidebar"] h3 {
         color: #ffffff !important;
-    }
-
-    /* 侧边栏 radio 导航 — 滑块指示器 */
-    section[data-testid="stSidebar"] [data-testid="stRadio"] {
-        gap: 0;
-    }
-    section[data-testid="stSidebar"] [data-testid="stRadio"] label {
-        color: #ffffff !important;
-        font-size: 0.9rem;
-        font-weight: 400;
-        padding: 12px 16px;
-        transition: all 0.25s ease;
-        border-left: 3px solid transparent;
-        background: transparent !important;
-    }
-    section[data-testid="stSidebar"] [data-testid="stRadio"] label:hover {
-        color: #ffffff !important;
-        border-left-color: rgba(214, 89, 56, 0.5);
-        background: rgba(255, 255, 255, 0.04) !important;
-    }
-    /* 隐藏 radio 圆点 */
-    section[data-testid="stSidebar"] [data-testid="stRadio"] [role="radio"],
-    section[data-testid="stSidebar"] [data-testid="stRadio"] [data-baseweb="radio"] {
-        display: none !important;
-    }
-    /* 选中项 — 滑块停留 */
-    section[data-testid="stSidebar"] [data-testid="stRadio"] [aria-checked="true"] label,
-    section[data-testid="stSidebar"] [data-testid="stRadio"] [data-baseweb="radio"][aria-checked="true"] + label {
-        color: #ffffff !important;
-        font-weight: 700;
-        border-left-color: #d65938;
-        border-left-width: 4px;
-        padding-left: 14px;
-        background: rgba(214, 89, 56, 0.1) !important;
     }
 
     /* 侧边栏分隔线 */
@@ -411,6 +404,33 @@ def inject_global_css():
         margin: 24px 0;
     }
 
+    /* ── Radio 按钮 — 选中态橙色（强覆盖） ── */
+    .stRadio [role="radio"] > div:first-child,
+    .stRadio [role="radio"] > div:first-child > div,
+    .stRadio [data-baseweb="radio"] > div,
+    .stRadio [data-baseweb="radio"]::before,
+    .stRadio [data-baseweb="radio"]::after {
+        background-color: #d65938 !important;
+        border-color: #d65938 !important;
+    }
+    .stRadio [role="radio"] svg,
+    .stRadio [data-baseweb="radio"] svg {
+        fill: #ffffff !important;
+        color: #ffffff !important;
+    }
+    .stRadio [role="radio"]:not([aria-checked="true"]) > div:first-child {
+        background-color: transparent !important;
+        border-color: #999999 !important;
+    }
+    .stRadio label {
+        color: #0d1429 !important;
+    }
+    .stRadio [aria-checked="true"] + div,
+    .stRadio [aria-checked="true"] ~ label {
+        color: #0d1429 !important;
+        font-weight: 600 !important;
+    }
+
     /* ── 按钮 — 黑底白字/白底黑边 ── */
     .stButton > button {
         border-radius: 12px;
@@ -419,13 +439,13 @@ def inject_global_css():
         transition: all 0.2s ease;
     }
     .stButton > button[kind="primary"] {
-        background: #0d1429;
+        background: #d65938;
         color: #ffffff;
-        border: 2px solid #0d1429;
+        border: 2px solid #d65938;
     }
     .stButton > button[kind="primary"]:hover {
-        background: #d65938;
-        border-color: #d65938;
+        background: #b94a2e;
+        border-color: #b94a2e;
     }
     .stButton > button[kind="secondary"] {
         background: #ffffff;

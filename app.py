@@ -170,7 +170,98 @@ st.sidebar.markdown("""
 """, unsafe_allow_html=True)
 
 st.sidebar.divider()
-page = st.sidebar.radio("导航", page_options, key="nav_page", label_visibility="collapsed")
+
+# ── 自定义滑块导航（替代 st.radio 避免圆点）──
+if "page" not in st.session_state:
+    st.session_state["page"] = "新建案件"
+# 关键：所有项（无论是否激活）都用 st.sidebar.button 渲染
+# 激活项通过 disabled=True 标记；外层容器统一是 stButton → 尺寸天然一致
+# 激活态用 button:disabled CSS 选择器单独定义左侧滑块 + 浅橙背景 + 纯白文字
+for opt in page_options:
+    is_active = st.session_state["page"] == opt
+    if st.sidebar.button(
+        opt,
+        key=f"nav_{opt}",
+        use_container_width=True,
+        disabled=is_active,
+    ):
+        st.session_state["page"] = opt
+        st.rerun()
+
+# 侧边栏导航按钮样式：所有项共享一套尺寸，仅 disabled 状态切换视觉
+st.sidebar.markdown("""
+<style>
+/* 容器：去掉 stButton 默认外边距，保证与未激活项 1:1 对齐 */
+section[data-testid="stSidebar"] div[data-testid="stButton"] {
+    margin: 0 !important;
+    padding: 0 !important;
+}
+
+/* 基础样式：所有导航按钮共享的 padding / 高度 / 圆角 / 左边框 */
+section[data-testid="stSidebar"] button[kind="secondary"] {
+    background: transparent !important;
+    border: none !important;
+    border-left: 3px solid transparent !important;
+    box-shadow: none !important;
+    text-align: left !important;
+    justify-content: flex-start !important;
+    align-items: center !important;
+    padding: 12px 16px !important;
+    font-size: 0.9rem !important;
+    font-weight: 400 !important;
+    color: #cfd5e0 !important;
+    border-radius: 0 4px 4px 0 !important;
+    transition: all 0.2s ease !important;
+    width: 100% !important;
+    min-height: 40px !important;
+    line-height: 1.2 !important;
+    box-sizing: border-box !important;
+}
+section[data-testid="stSidebar"] button[kind="secondary"] p,
+section[data-testid="stSidebar"] button[kind="secondary"] div {
+    text-align: left !important;
+    justify-content: flex-start !important;
+    width: 100% !important;
+    font-weight: 400 !important;
+    line-height: 1.2 !important;
+    color: inherit !important;
+}
+
+/* 未激活：hover 提示（仅作用于非 disabled） */
+section[data-testid="stSidebar"] button[kind="secondary"]:not(:disabled):hover {
+    background: rgba(255,255,255,0.05) !important;
+    border-left-color: rgba(214,89,56,0.4) !important;
+}
+section[data-testid="stSidebar"] button[kind="secondary"]:not(:disabled):focus:not(:active) {
+    background: transparent !important;
+    border-color: transparent !important;
+    box-shadow: none !important;
+    color: #cfd5e0 !important;
+}
+
+/* 激活态：disabled 按钮 — 橙色滑块 + 浅橙背景 + 纯白文字 */
+section[data-testid="stSidebar"] button[kind="secondary"]:disabled {
+    background: rgba(214,89,56,0.12) !important;
+    border-left: 3px solid #d65938 !important;
+    color: #ffffff !important;
+    cursor: default !important;
+    opacity: 1 !important;
+}
+section[data-testid="stSidebar"] button[kind="secondary"]:disabled:hover {
+    background: rgba(214,89,56,0.12) !important;
+    border-left: 3px solid #d65938 !important;
+    color: #ffffff !important;
+}
+section[data-testid="stSidebar"] button[kind="secondary"]:disabled p,
+section[data-testid="stSidebar"] button[kind="secondary"]:disabled div {
+    color: #ffffff !important;
+    font-weight: 400 !important;
+    opacity: 1 !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
+page = st.session_state["page"]
 
 # 当前案件上下文
 if "current_case_id" in st.session_state:
@@ -210,107 +301,107 @@ st.sidebar.markdown(f"""
 # 页面 1: 新建案件
 # ============================================================
 if page == "新建案件":
-    page_header("新建商标侵权案件", "上传证据文件，填写案情描述，开始诉前评估")
+    page_header("新建商标侵权案件", "左侧填写案件信息，右侧上传证据材料")
 
-    # ── 证据上传区 ──
-    form_section_title("证据文件上传")
-    uploaded_files = st.file_uploader(
-        "支持 PDF（自动提取文本）和图片（OCR 识别文字）",
-        type=["pdf", "png", "jpg", "jpeg"],
-        accept_multiple_files=True,
-        key="evidence_uploader",
-        help="上传商标注册证、侵权截图、公证文书等证据文件",
-        label_visibility="collapsed"
-    )
+    # ── 整页两栏：左 = 案件信息表单 / 右 = 证据上传 ──
+    col_form, col_evidence = st.columns([1, 1], gap="medium")
 
-    parsed_evidences = []
-    if uploaded_files:
-        for f in uploaded_files:
-            cache_key = f"parsed_{f.name}_{f.size}"
-            if cache_key not in st.session_state:
-                with st.spinner(f"正在解析 {f.name} ..."):
-                    file_bytes = f.getvalue()
-                    if is_pdf_file(f.name):
-                        result = parse_pdf(file_bytes, f.name)
-                    elif is_image_file(f.name):
-                        result = ocr_image(file_bytes, f.name)
-                    else:
-                        result = {"success": False, "text": "", "error": "不支持的文件格式"}
-                    if result["success"] and len(result["text"]) > 3000:
-                        result["text"] = result["text"][:3000] + "\n\n... (文本过长，已截取)"
-                    st.session_state[cache_key] = result
-            parsed = st.session_state[cache_key]
-            parsed_evidences.append((f.name, f.size, parsed))
+    # ════════ 左栏：案件信息表单 ════════
+    with col_form:
+        form_section_title("案件信息")
+        default_desc = st.session_state.get("last_case_desc", "")
 
-    if parsed_evidences:
+        with st.form("new_case_form"):
+            case_name = st.text_input("案件名称 *", placeholder="例如：某品牌诉某电商商标侵权案")
+            cause_type = st.selectbox("案由", ["商标侵权", "著作权侵权", "不正当竞争"], disabled=True)
+            evidence_extra = st.session_state.get("evidence_text_extra", "")
+            prefill = (evidence_extra + "\n\n" + default_desc).strip()
+            case_description = st.text_area(
+                "案情描述 *", height=110, value=prefill,
+                placeholder="请详细描述案情，包括：\n- 原告商标信息（注册号、类别、有效期）\n- 被告侵权行为（何时发现、如何侵权）\n- 侵权商品销售情况\n- 已收集的证据"
+            )
+            client_org = st.text_input("委托客户", placeholder="例如：某知名品牌公司")
+            goal_type = st.radio("业务目标", ["要钱", "要名"], horizontal=True)
+
+            submitted = st.form_submit_button("创建案件并开始评估", type="primary", use_container_width=True)
+
+            if submitted:
+                full_desc = case_description.strip()
+                if not case_name or not full_desc:
+                    st.error("请填写必填项（案件名称、案情描述）")
+                else:
+                    db = SessionLocal()
+                    try:
+                        new_case = Case(
+                            name=case_name, cause_type="商标侵权",
+                            goal_type=goal_type, client_org=client_org or "",
+                            case_description=full_desc, status="draft"
+                        )
+                        db.add(new_case)
+                        db.commit()
+                        db.refresh(new_case)
+                        st.session_state["current_case_id"] = new_case.id
+                        st.session_state["current_case_name"] = new_case.name
+                        st.session_state["last_case_desc"] = full_desc
+                        st.session_state["evidence_text_extra"] = ""
+                        st.session_state["nav_target"] = "评估分析"
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"创建失败: {e}")
+                        db.rollback()
+                    finally:
+                        db.close()
+
+    # ════════ 右栏：证据上传 ════════
+    with col_evidence:
+        form_section_title("证据文件上传")
+        uploaded_files = st.file_uploader(
+            "支持 PDF（自动提取文本）和图片（OCR 识别文字）",
+            type=["pdf", "png", "jpg", "jpeg"],
+            accept_multiple_files=True,
+            key="evidence_uploader",
+            help="上传商标注册证、侵权截图、公证文书等证据文件",
+            label_visibility="collapsed"
+        )
+
+        parsed_evidences = []
+        if uploaded_files:
+            for f in uploaded_files:
+                cache_key = f"parsed_{f.name}_{f.size}"
+                if cache_key not in st.session_state:
+                    with st.spinner(f"正在解析 {f.name} ..."):
+                        file_bytes = f.getvalue()
+                        if is_pdf_file(f.name):
+                            result = parse_pdf(file_bytes, f.name)
+                        elif is_image_file(f.name):
+                            result = ocr_image(file_bytes, f.name)
+                        else:
+                            result = {"success": False, "text": "", "error": "不支持的文件格式"}
+                        if result["success"] and len(result["text"]) > 3000:
+                            result["text"] = result["text"][:3000] + "\n\n... (文本过长，已截取)"
+                        st.session_state[cache_key] = result
+                parsed = st.session_state[cache_key]
+                parsed_evidences.append((f.name, f.size, parsed))
+
         for fname, fsize, result in parsed_evidences:
             if result["success"]:
                 text_len = len(result["text"])
                 with st.expander(f"{fname}（{text_len} 字）"):
-                    st.text_area(f"内容 - {fname}", value=result["text"], height=160,
+                    st.text_area(f"内容 - {fname}", value=result["text"], height=120,
                                  key=f"preview_{fname}", label_visibility="collapsed")
-                    if st.button(f"追加到案情描述", key=f"append_{hash(fname)}"):
+                    if st.button("追加到案情描述", key=f"append_{hash(fname)}"):
                         current_extra = st.session_state.get("evidence_text_extra", "")
                         st.session_state["evidence_text_extra"] = current_extra + f"\n\n【证据文件: {fname}】\n{result['text']}"
                         st.rerun()
             else:
                 st.warning(f"{fname}: {result['error']}")
 
-    evidence_extra = st.session_state.get("evidence_text_extra", "")
-    if evidence_extra:
-        st.success(f"已追加 {len(evidence_extra)} 字证据文本到案情描述")
-        if st.button("🗑️ 清除已追加的证据文本", type="secondary"):
-            st.session_state["evidence_text_extra"] = ""
-            st.rerun()
-
-    st.markdown("")
-
-    # ── 案件表单 ──
-    form_section_title("案件信息")
-    default_desc = st.session_state.get("last_case_desc", "")
-
-    with st.form("new_case_form"):
-        col1, col2 = st.columns(2)
-        with col1:
-            case_name = st.text_input("案件名称 *", placeholder="例如：某品牌诉某电商商标侵权案")
-            cause_type = st.selectbox("案由", ["商标侵权", "著作权侵权", "不正当竞争"], disabled=True)
-            goal_type = st.radio("业务目标", ["要钱", "要名"], horizontal=True)
-        with col2:
-            client_org = st.text_input("委托客户", placeholder="例如：某知名品牌公司")
-            prefill = (evidence_extra + "\n\n" + default_desc).strip()
-            case_description = st.text_area(
-                "案情描述 *", height=300, value=prefill,
-                placeholder="请详细描述案情，包括：\n- 原告商标信息（注册号、类别、有效期）\n- 被告侵权行为（何时发现、如何侵权）\n- 侵权商品销售情况\n- 已收集的证据"
-            )
-
-        submitted = st.form_submit_button("创建案件并开始评估", type="primary", use_container_width=True)
-
-        if submitted:
-            full_desc = case_description.strip()
-            if not case_name or not full_desc:
-                st.error("请填写必填项（案件名称、案情描述）")
-            else:
-                db = SessionLocal()
-                try:
-                    new_case = Case(
-                        name=case_name, cause_type="商标侵权",
-                        goal_type=goal_type, client_org=client_org or "",
-                        case_description=full_desc, status="draft"
-                    )
-                    db.add(new_case)
-                    db.commit()
-                    db.refresh(new_case)
-                    st.session_state["current_case_id"] = new_case.id
-                    st.session_state["current_case_name"] = new_case.name
-                    st.session_state["last_case_desc"] = full_desc
-                    st.session_state["evidence_text_extra"] = ""
-                    st.session_state["nav_target"] = "评估分析"
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"创建失败: {e}")
-                    db.rollback()
-                finally:
-                    db.close()
+        evidence_extra_show = st.session_state.get("evidence_text_extra", "")
+        if evidence_extra_show:
+            st.success(f"已追加 {len(evidence_extra_show)} 字证据文本到案情描述")
+            if st.button("清除已追加的证据文本", type="secondary"):
+                st.session_state["evidence_text_extra"] = ""
+                st.rerun()
 
 
 # ============================================================
