@@ -67,10 +67,14 @@ def generate_markdown_report(case_info: Dict, score_result: Dict, rule_results: 
 
 """
     for rule in rule_results:
-        status_icon = "✅" if rule["severity"] == "pass" else ("⚠️" if rule["severity"] == "warning" else "🚫")
-        md += f"### {status_icon} {rule['rule_name']}\n\n"
-        md += f"**结果**: {rule['result']}\n\n"
-        md += f"**说明**: {rule['reason']}\n\n"
+        severity = rule.get("severity", rule.get("status", "pass"))
+        rule_name = rule.get("rule_name", rule.get("name", "未知规则"))
+        result = rule.get("result", rule.get("detail", rule.get("status", "通过")))
+        reason = rule.get("reason", rule.get("detail", ""))
+        status_icon = "✅" if severity == "pass" else ("⚠️" if severity == "warning" else "🚫")
+        md += f"### {status_icon} {rule_name}\n\n"
+        md += f"**结果**: {result}\n\n"
+        md += f"**说明**: {reason}\n\n"
 
     md += "---\n\n"
 
