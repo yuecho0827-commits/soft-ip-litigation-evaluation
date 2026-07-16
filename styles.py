@@ -102,29 +102,38 @@ def inject_global_css():
         color: #ffffff !important;
     }
 
-    /* 侧边栏 radio 导航 — 强对比 */
+    /* 侧边栏 radio 导航 — 滑块指示器 */
+    section[data-testid="stSidebar"] [data-testid="stRadio"] {
+        gap: 0;
+    }
     section[data-testid="stSidebar"] [data-testid="stRadio"] label {
         color: #ffffff !important;
         font-size: 0.9rem;
         font-weight: 400;
-        padding: 10px 0;
-        transition: all 0.2s ease;
+        padding: 12px 16px;
+        transition: all 0.25s ease;
         border-left: 3px solid transparent;
-        padding-left: 14px;
-        border-radius: 0 4px 4px 0;
+        background: transparent !important;
     }
     section[data-testid="stSidebar"] [data-testid="stRadio"] label:hover {
         color: #ffffff !important;
-        border-left-color: #d65938;
-        background: rgba(255, 255, 255, 0.05);
+        border-left-color: rgba(214, 89, 56, 0.5);
+        background: rgba(255, 255, 255, 0.04) !important;
     }
-    /* 选中的 radio 项 — 高亮指示 */
+    /* 隐藏 radio 圆点 */
+    section[data-testid="stSidebar"] [data-testid="stRadio"] [role="radio"],
+    section[data-testid="stSidebar"] [data-testid="stRadio"] [data-baseweb="radio"] {
+        display: none !important;
+    }
+    /* 选中项 — 滑块停留 */
     section[data-testid="stSidebar"] [data-testid="stRadio"] [aria-checked="true"] label,
-    section[data-testid="stSidebar"] [data-testid="stRadio"] [data-baseweb="radio"] [aria-checked="true"] + label {
+    section[data-testid="stSidebar"] [data-testid="stRadio"] [data-baseweb="radio"][aria-checked="true"] + label {
         color: #ffffff !important;
-        font-weight: 600;
+        font-weight: 700;
         border-left-color: #d65938;
-        background: rgba(214, 89, 56, 0.12);
+        border-left-width: 4px;
+        padding-left: 14px;
+        background: rgba(214, 89, 56, 0.1) !important;
     }
 
     /* 侧边栏分隔线 */
