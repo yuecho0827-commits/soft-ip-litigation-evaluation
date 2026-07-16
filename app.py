@@ -26,11 +26,11 @@ from styles import (
 # 评估引擎
 if USE_MOCK:
     from mock_llm import (
-        extract_case_facts as evaluate_rights_foundation,
-        analyze_legal_elements as evaluate_infringement,
-        check_rules as evaluate_procedure,
-        generate_score as evaluate_financial_return,
-        generate_report as evaluate_precedent_value,
+        evaluate_rights_foundation,
+        evaluate_infringement,
+        evaluate_procedure,
+        evaluate_financial_return,
+        evaluate_precedent_value,
         evaluate_evidence_readiness,
         run_moot_court_simulation,
     )
@@ -325,25 +325,29 @@ elif page == "案件列表":
         if not cases:
             st.info("暂无案件，请先创建案件")
         else:
+            # 预取所有评分
+            case_data = []
             for c in cases:
-                # 获取最新评分
                 score = db.query(ScoreSnapshot).filter(
                     ScoreSnapshot.case_id == c.id
                 ).order_by(ScoreSnapshot.id.desc()).first()
+                case_data.append((c, score))
 
-                col_card, col_btn = st.columns([5, 1])
-                with col_card:
-                    case_card(c.id, c.name, c.cause_type, c.goal_type, c.status,
-                             score.final_score if score else None,
-                             score.recommendation if score else None)
-                with col_btn:
-                    st.write("")
-                    st.write("")
-                    if st.button("查看 →", key=f"v_{c.id}", use_container_width=True):
-                        st.session_state["current_case_id"] = c.id
-                        st.session_state["current_case_name"] = c.name
-                        st.session_state["nav_target"] = "评估分析"
-                        st.rerun()
+            # 两列网格布局
+            for i in range(0, len(case_data), 2):
+                cols = st.columns(2)
+                for j in range(2):
+                    if i + j < len(case_data):
+                        c, score = case_data[i + j]
+                        with cols[j]:
+                            case_card(c.id, c.name, c.cause_type, c.goal_type, c.status,
+                                     score.final_score if score else None,
+                                     score.recommendation if score else None)
+                            if st.button("查看 →", key=f"v_{c.id}", use_container_width=True):
+                                st.session_state["current_case_id"] = c.id
+                                st.session_state["current_case_name"] = c.name
+                                st.session_state["nav_target"] = "评估分析"
+                                st.rerun()
     finally:
         db.close()
 
@@ -369,6 +373,11 @@ elif page == "评估分析":
             st.stop()
 
         # ── 案件信息卡片 ──
+        status_map = {"draft": "草稿", "evaluating": "评估中", "completed": "已完成"}
+        status_text = status_map.get(case.status, "未知")
+        status_colors = {"draft": COLORS["text_muted"], "evaluating": COLORS["warning"], "completed": COLORS["accent"]}
+        st_color = status_colors.get(case.status, COLORS["text_muted"])
+
         st.markdown(f"""
         <div class="card" style="border-left:4px solid {COLORS['primary']};">
             <div style="display:flex;justify-content:space-between;align-items:center;">
@@ -380,17 +389,21 @@ elif page == "评估分析":
                     </div>
                 </div>
                 <div>
-                    {{"draft":"草稿","evaluating":"评估中","completed":"已完成"}}.get(case.status, "未知")
+                    <span class="status-badge" style="background:{'#ffffff'};color:{st_color};border-color:{st_color};">{status_text}</span>
                 </div>
             </div>
         </div>
-        """.replace('{{"draft"', '{"draft"').replace('}}.get', '}}.get'), unsafe_allow_html=True)
+        """, unsafe_allow_html=True)
 
         with st.expander("查看案情描述", expanded=False):
             st.text_area("", case.case_description, height=200, disabled=True, label_visibility="collapsed")
 
-        # 如果已完成 → 显示历史结果
-        if case.status == "completed":
+        # ── 检查评估结果是否已在 session state ──
+        eval_key = f"eval_results_{case_id}"
+        eval_data = st.session_state.get(eval_key)
+
+        # 已完成案件但 session state 无结果 → 从 DB 显示摘要
+        if case.status == "completed" and not eval_data:
             latest = db.query(ScoreSnapshot).filter(ScoreSnapshot.case_id == case_id).order_by(ScoreSnapshot.id.desc()).first()
             if latest:
                 col_m1, col_m2, col_m3 = st.columns(3)
@@ -402,303 +415,127 @@ elif page == "评估分析":
                     metric_card("建议", latest.recommendation, "", COLORS["primary"])
                 st.markdown("")
 
-        # 评估按钮
+        # ── 评估按钮 ──
         col_sp1, col_btn, col_sp2 = st.columns([1, 2, 1])
         with col_btn:
-            do_eval = st.button("开始评估", type="primary", use_container_width=True)
+            btn_label = "重新评估" if eval_data else "开始评估"
+            do_eval = st.button(btn_label, type="primary", use_container_width=True)
 
+        # ════════════════════════════════════════════════════
+        # 评估执行流水线
+        # ════════════════════════════════════════════════════
         if do_eval:
             progress = st.progress(0, "初始化评估引擎...")
             evidence_texts = st.session_state.get("evidence_text_extra", "")
 
-            # ════════════════════════════════════════════════════
-            # 维度一：法律可行性
-            # ════════════════════════════════════════════════════
+            # ── 维度一：法律可行性 ──
             section_banner("维度一：法律可行性", "回答「能不能诉」", COLORS["primary"])
 
             # 1.1 权利基础
             progress.progress(8, "1/7 权利基础评估...")
-            with st.spinner("正在分析商标权利基础（有效性、撤三风险、覆盖范围、驰名地位）..."):
-                rights_result = evaluate_rights_foundation(case.case_description, uploaded_texts=evidence_texts if not _mock else "")
-            if "error" in rights_result:
+            with st.spinner("正在分析商标权利基础..."):
+                rights_result = evaluate_rights_foundation(case.case_description, uploaded_texts=evidence_texts)
+            if rights_result.get("error"):
                 st.error(f"权利基础评估失败: {rights_result.get('error', '')[:200]}")
-            else:
-                sub_scores = []
-                for k, v in rights_result.get('sub_scores', {}).items():
-                    label = {"validity":"商标有效性","usage_continuity":"连续使用","coverage":"覆盖范围","well_known_status":"驰名地位","risk_of_invalidation":"无效风险"}.get(k, k)
-                    sub_scores.append({"name": label, "score": v, "status": "pass" if v >= 60 else "warning"})
-                dim_card("1.1 权利基础评估", rights_result.get('score', 0),
-                         rights_result.get('analysis', ''), sub_items=sub_scores,
-                         extra="优势: " + ", ".join(rights_result.get('strengths', ['-'])) + "\n\n风险: " + ", ".join(rights_result.get('risks', ['-'])))
-
-            with st.expander("北大法宝 · 法条检索（验证权利基础）"):
-                pkulaw_rights = get_dimension_results(case_id, "1.1_权利基础")
-                if pkulaw_rights:
-                    for law in pkulaw_rights.get("laws", [])[:3]:
-                        st.markdown(f"**{law.get('title', law.get('name',''))}**")
-                        st.caption(law.get('content', law.get('text',''))[:300])
-                else:
-                    st.info("尚未检索。评估完成后，让 AI 助手通过北大法宝检索验证。")
+                rights_result = {"score": 0, "sub_scores": {}, "analysis": "", "strengths": [], "risks": [], "error": rights_result.get("error")}
 
             # 1.2 侵权认定
             progress.progress(22, "2/7 侵权认定评估...")
-            with st.spinner("正在分析商标侵权五要件（商标性使用、商品类似性、近似性、混淆可能性、正当使用）..."):
+            with st.spinner("正在分析商标侵权五要件..."):
                 infringement_result = evaluate_infringement(case.case_description,
                     rights_assessment=str(rights_result.get('analysis', '')),
-                    uploaded_texts=evidence_texts if not _mock else "")
-            if "error" in infringement_result:
+                    uploaded_texts=evidence_texts)
+            if infringement_result.get("error"):
                 st.error(f"侵权认定失败: {infringement_result.get('error', '')[:200]}")
-            else:
-                el_items = [{"name": el['name'], "score": el['score'], "status": el.get('status','pass'), "detail": el.get('analysis','')} for el in infringement_result.get('elements', [])]
-                dim_card("1.2 侵权认定评估", infringement_result.get('score', 0),
-                         infringement_result.get('analysis', ''), sub_items=el_items)
-
-            with st.expander("北大法宝 · 类案检索（验证侵权认定标准）"):
-                pkulaw_inf = get_dimension_results(case_id, "1.2_侵权认定")
-                if pkulaw_inf:
-                    for c in pkulaw_inf.get("cases", [])[:3]:
-                        st.markdown(f"**{c.get('title', c.get('name',''))}**")
-                        st.caption(f"{c.get('court','')} | {c.get('date','')}")
-                else:
-                    st.info("尚未检索。评估完成后，让 AI 助手通过北大法宝检索验证。")
+                infringement_result = {"score": 0, "elements": [], "analysis": "", "risks": [], "error": infringement_result.get("error")}
 
             # 1.3 诉讼程序
             progress.progress(36, "3/7 程序审查...")
-            with st.spinner("正在审查诉讼时效、管辖仲裁、主体适格、前置程序..."):
+            with st.spinner("正在审查诉讼时效、管辖仲裁、主体适格..."):
                 procedure_result = evaluate_procedure(case.case_description)
-            if "error" in procedure_result:
+            if procedure_result.get("error"):
                 st.error(f"程序审查失败: {procedure_result.get('error', '')[:200]}")
-            else:
-                proc_items = [{"name": p['name'], "status": p.get('status','pass'), "detail": p.get('detail','')} for p in procedure_result.get('items', [])]
-                dim_card("1.3 诉讼程序审查", procedure_result.get('score', 0),
-                         procedure_result.get('analysis', ''), sub_items=proc_items)
-
-            with st.expander("北大法宝 · 法条检索（验证诉讼程序依据）"):
-                pkulaw_proc = get_dimension_results(case_id, "1.3_诉讼程序")
-                if pkulaw_proc:
-                    for law in pkulaw_proc.get("laws", [])[:3]:
-                        st.markdown(f"**{law.get('title', law.get('name',''))}**")
-                        st.caption(law.get('content', law.get('text',''))[:300])
-                else:
-                    st.info("尚未检索。评估完成后，让 AI 助手通过北大法宝检索验证。")
+                procedure_result = {"score": 0, "items": [], "analysis": "", "block_items": [], "error": procedure_result.get("error")}
 
             # 1.4 模拟法庭
             progress.progress(50, "4/7 模拟法庭对抗检验...")
             section_banner("1.4 模拟法庭（多Agent对抗检验）", "原告Agent ↔ 被告Agent ↔ 法官Agent", COLORS["accent"])
-
             mode_label = "Mock 模拟" if _mock else "DeepSeek API"
-            with st.spinner(f"正在进行五步庭审模拟（{mode_label}）：开庭陈述 → 被告答辩 → 举证质证 → 法庭辩论 → 法官归纳..."):
+            with st.spinner(f"正在进行五步庭审模拟（{mode_label}）..."):
                 moot_result = run_moot_court_simulation(case.case_description,
                     rights_assessment=str(rights_result.get('analysis', '')),
                     infringement_assessment=str(infringement_result.get('analysis', '')),
                     evidence_summary=evidence_texts[:1500] if evidence_texts else "")
 
             if moot_result.get("error") and not moot_result.get("rounds"):
-                st.warning(f"模拟法庭异常: {moot_result.get('error', '')[:200]}")
                 correction_coeff = 1.0
             else:
                 correction_coeff = moot_result.get('correction_coefficient', 1.0)
-                defense_strength = moot_result.get('defense_strength', 50)
-
-                # 修正系数 + 抗辩强度
-                coeff_color = COLORS["danger"] if correction_coeff < 0.9 else COLORS["warning"] if correction_coeff < 1.0 else COLORS["success"]
-                col_c1, col_c2 = st.columns(2)
-                with col_c1:
-                    metric_card("对抗修正系数", f"{correction_coeff:.2f}",
-                                "被告抗辩有效削弱原告论证" if correction_coeff < 1.0 else "原告论证在对抗中成立", coeff_color)
-                with col_c2:
-                    metric_card("被告抗辩强度", f"{defense_strength}/100",
-                                "抗辩有力" if defense_strength >= 60 else "抗辩一般" if defense_strength >= 40 else "抗辩薄弱",
-                                COLORS["warning"])
-
-                # 庭审记录
-                rounds = moot_result.get('rounds', [])
-                if rounds:
-                    with st.expander(f"庭审记录（共{len(rounds)}轮发言）"):
-                        for rnd in rounds:
-                            role = rnd.get('role', rnd.get('speaker', ''))
-                            role_name = rnd.get('role_name', role)
-                            step_name = rnd.get('step_name', '')
-                            content = rnd.get('content', '')
-
-                            if 'plaintiff' in str(role) or '原告' in str(role_name):
-                                role_type = "plaintiff"
-                            elif 'defendant' in str(role) or '被告' in str(role_name):
-                                role_type = "defendant"
-                            else:
-                                role_type = "judge"
-                            chat_bubble(role_name, step_name, content, role_type)
-
-                # 法官评分
-                judge_scores = moot_result.get('judge_scores', {})
-                if judge_scores and judge_scores.get('plaintiff'):
-                    with st.expander("法官评分明细"):
-                        p_scores = judge_scores.get('plaintiff', {})
-                        d_scores = judge_scores.get('defendant', {})
-                        p_detail = judge_scores.get('plaintiff_detail', {})
-                        d_detail = judge_scores.get('defendant_detail', {})
-
-                        col_p, col_d = st.columns(2)
-                        with col_p:
-                            st.markdown(f"**{ROLE_COLORS['plaintiff']['label']} 原告论证强度**")
-                            label_map = {"rights":"权利基础","infringement":"侵权认定","evidence":"证据体系","legal_application":"法律适用","claim_reasonableness":"诉求合理性"}
-                            for k, v in p_scores.items():
-                                label = label_map.get(k, k)
-                                detail = p_detail.get(k, "")
-                                st.markdown(f"• **{label}**: {v} 分" + (f" — {detail}" if detail else ""))
-
-                        with col_d:
-                            st.markdown(f"**{ROLE_COLORS['defendant']['label']} 被告抗辩强度**")
-                            d_label_map = {"fact_defense":"事实抗辩","legal_defense":"法律抗辩","evidence_challenge":"证据质疑","alternative_explanation":"替代解释","procedural_defense":"程序抗辩"}
-                            for k, v in d_scores.items():
-                                label = d_label_map.get(k, k)
-                                detail = d_detail.get(k, "")
-                                st.markdown(f"• **{label}**: {v} 分" + (f" — {detail}" if detail else ""))
-
-                        reasoning = judge_scores.get('coefficient_reasoning', '')
-                        if reasoning:
-                            st.info(f"**修正系数推理**: {reasoning}")
-
-                # 薄弱环节
-                weak_points = moot_result.get('weak_points', [])
-                if weak_points:
-                    st.markdown("**对抗暴露的薄弱环节:**")
-                    for wp in weak_points:
-                        st.markdown(f"- {wp}")
-
-                st.caption("前往「模拟法庭」页面可查看完整庭审记录和交互式回放")
 
             # 维度一小计
             legal_score = calculate_legal_feasibility(
                 rights_result.get('score', 0), infringement_result.get('score', 0),
                 procedure_result.get('score', 0), correction_coeff
             )
-            st.success(f"**维度一 法律可行性综合得分: {legal_score} 分**")
-            st.caption(f"公式: 权利基础({rights_result.get('score',0)}) × 侵权认定({infringement_result.get('score',0)}) × 诉讼程序({procedure_result.get('score',0)}) × 对抗修正({correction_coeff:.2f}) = {legal_score}")
 
-            # ════════════════════════════════════════════════════
-            # 维度二：业务预期
-            # ════════════════════════════════════════════════════
-            section_banner("维度二：业务预期", f"目标：{case.goal_type} · 回答「值不值得诉」", COLORS["warning"])
-
+            # ── 维度二：业务预期 ──
             progress.progress(64, "5/7 财务回报评估...")
-            with st.spinner("正在预测判赔区间、诉讼成本和净收益..."):
+            with st.spinner("正在预测判赔区间和诉讼成本..."):
                 financial_result = evaluate_financial_return(case.case_description)
-            if "error" in financial_result:
-                st.warning(f"财务评估异常: {financial_result.get('error', '')[:200]}")
-                fin_score = 50
-            else:
-                fin_score = financial_result.get('score', 50)
-                de = financial_result.get('damages_estimate', {})
-                te = financial_result.get('time_estimate', {})
-                fin_extra = []
-                if de: fin_extra.append(f"判赔预测: P10=¥{de.get('p10','-')} / P50=¥{de.get('p50','-')} / P90=¥{de.get('p90','-')}")
-                fin_extra.append(f"预估成本: ¥{financial_result.get('cost_estimate','-')}")
-                if te: fin_extra.append(f"时间: 一审{te.get('first_instance_months','-')}月 + 二审{te.get('second_instance_months','-')}月 + 执行{te.get('enforcement_months','-')}月")
-                fin_extra.append(f"回款概率: {financial_result.get('recovery_probability','-')}%")
-                dim_card("2.1 财务回报评估", fin_score, financial_result.get('analysis', ''), extra="\n".join(fin_extra))
+            if financial_result.get("error"):
+                financial_result = {"score": 50, "damages_estimate": {}, "cost_estimate": "-", "time_estimate": {}, "recovery_probability": "-", "analysis": "", "error": financial_result.get("error")}
 
             progress.progress(78, "6/7 判例价值评估...")
-            with st.spinner("正在评估首案潜力、指导性案例入选概率..."):
+            with st.spinner("正在评估首案潜力和指导性案例入选概率..."):
                 precedent_result = evaluate_precedent_value(case.case_description)
-            if "error" in precedent_result:
-                st.warning(f"判例价值异常: {precedent_result.get('error', '')[:200]}")
-                prec_score = 50
-            else:
-                prec_score = precedent_result.get('score', 50)
-                dim_card("2.2 判例价值评估", prec_score, precedent_result.get('analysis', ''),
-                         extra=f"首案指数: {precedent_result.get('first_case_index','-')} | 影响力级别: {precedent_result.get('influence_level','-')}")
+            if precedent_result.get("error"):
+                precedent_result = {"score": 50, "first_case_index": "-", "influence_level": "-", "analysis": "", "error": precedent_result.get("error")}
 
-            with st.expander("北大法宝 · 首案检索（判例价值主力引擎）"):
-                pkulaw_prec = get_dimension_results(case_id, "2.2_判例价值")
-                if pkulaw_prec:
-                    for c in pkulaw_prec.get("cases", [])[:5]:
-                        st.markdown(f"**{c.get('title', c.get('name',''))}**")
-                        st.caption(f"{c.get('court','')} | {c.get('date','')} | {c.get('summary','')[:150] if c.get('summary') else ''}")
-                else:
-                    st.info("尚未检索。评估完成后，让 AI 助手通过北大法宝检索同类在先判决。")
+            business_score = calculate_business_expectation(
+                financial_result.get('score', 50), precedent_result.get('score', 50), case.goal_type)
 
-            business_score = calculate_business_expectation(fin_score, prec_score, case.goal_type)
-            st.success(f"**维度二 业务预期综合得分: {business_score} 分**")
-            if case.goal_type == "要钱":
-                st.caption(f"公式: 0.9×财务({fin_score}) + 0.1×判例({prec_score}) = {business_score}")
-            else:
-                st.caption(f"公式: 0.1×财务({fin_score}) + 0.9×判例({prec_score}) = {business_score}")
-
-            # ════════════════════════════════════════════════════
-            # 维度三：证据就绪度
-            # ════════════════════════════════════════════════════
-            section_banner("维度三：证据就绪度", "回答「现在能不能诉」", COLORS["success"])
-
+            # ── 维度三：证据就绪度 ──
             progress.progress(92, "7/7 证据就绪度评估...")
             with st.spinner("正在逐项核验证据完整性..."):
                 evidence_result = evaluate_evidence_readiness(case.case_description,
                     uploaded_evidence_texts=evidence_texts, evidence_count=0)
-            if "error" in evidence_result:
-                st.warning(f"证据评估异常: {evidence_result.get('error', '')[:200]}")
-                evidence_score = 60
-            else:
-                evidence_score = evidence_result.get('score', 60)
-                ev_items = [{"name": m['requirement'], "status": m.get('status','不足'), "detail": m.get('analysis','')} for m in evidence_result.get('evidence_matrix', [])]
-                dim_card("证据就绪度评估", evidence_score, evidence_result.get('analysis', ''),
-                         sub_items=ev_items,
-                         extra="补证建议: " + ("; ".join(evidence_result.get('remediation_suggestions', ['无']))) + "\n\n取证技术建议: " + evidence_result.get('collection_advice', '根据证据类型自行判断'))
+            if evidence_result.get("error"):
+                evidence_result = {"score": 60, "evidence_matrix": [], "analysis": "", "missing_items": [], "remediation_suggestions": [], "collection_advice": "", "error": evidence_result.get("error")}
 
-            st.success(f"**维度三 证据就绪度得分: {evidence_score} 分**")
+            evidence_score = evidence_result.get('score', 60)
 
-            # ════════════════════════════════════════════════════
-            # 综合评分
-            # ════════════════════════════════════════════════════
-            st.markdown("---")
+            # ── 综合评分 ──
             progress.progress(97, "计算综合评分...")
-
             final_score = calculate_overall_score(legal_score, business_score, evidence_score)
             rec = generate_recommendation(final_score, procedure_result.get('items', []))
-            rec_color = {"green": COLORS["success"], "yellow": COLORS["warning"], "red": COLORS["danger"], "block": COLORS["danger"]}.get(rec['level'], COLORS["success"])
 
-            final_score_card(final_score, rec['recommendation'], rec['reason'], rec_color)
-
-            # 评分条 + 雷达图
-            col_bars, col_radar = st.columns([1, 1])
-            with col_bars:
-                st.markdown("##### 各维度得分")
-                score_bar("法律可行性", legal_score, COLORS["primary"], "权利 × 侵权 × 程序 × 对抗修正")
-                score_bar("业务预期", business_score, COLORS["warning"], "要钱/要名自适应加权")
-                score_bar("证据就绪度", evidence_score, COLORS["success"], "证据完整性与补证")
-                st.markdown(f"**乘法模型**: {legal_score} × {business_score} × {evidence_score} = **{final_score}**")
-                st.caption(f"对抗修正系数: {correction_coeff:.2f} · 一票否决逻辑")
-
-            with col_radar:
-                st.markdown("##### 三维雷达图")
-                radar_html = render_radar_html({
-                    "法律可行性": legal_score,
-                    "业务预期": business_score,
-                    "证据就绪度": evidence_score
-                })
-                st.markdown(radar_html, unsafe_allow_html=True)
-
-            # 北大法宝验证
-            with st.expander("北大法宝 · 法条与案号验证"):
-                valid_status = get_validation_status(case_id)
-                col_v1, col_v2, col_v3 = st.columns(3)
-                with col_v1:
-                    metric_card("法条验证", "通过" if valid_status["provisions_validated"] else "待验证", "")
-                with col_v2:
-                    metric_card("法规识别", "通过" if valid_status["laws_validated"] else "待验证", "")
-                with col_v3:
-                    metric_card("案号识别", "通过" if valid_status["cases_validated"] else "待验证", "")
-                if not all([valid_status["provisions_validated"], valid_status["laws_validated"], valid_status["cases_validated"]]):
-                    st.warning("评估完成后，请让 AI 助手运行北大法宝验证，确保法条和案号引用真实有效")
-
-            # 保存
-            db.add(ScoreSnapshot(case_id=case_id, legal_score=legal_score, business_score=business_score,
-                evidence_score=evidence_score, confidence_score=70, final_score=final_score, recommendation=rec['recommendation']))
+            # ── 存入 session state ──
+            eval_data = {
+                "rights": rights_result,
+                "infringement": infringement_result,
+                "procedure": procedure_result,
+                "moot": moot_result,
+                "financial": financial_result,
+                "precedent": precedent_result,
+                "evidence": evidence_result,
+                "legal_score": legal_score,
+                "business_score": business_score,
+                "evidence_score": evidence_score,
+                "final_score": final_score,
+                "recommendation": rec,
+                "correction_coeff": correction_coeff,
+            }
+            st.session_state[eval_key] = eval_data
             for k, v in [("rights", rights_result), ("infringement", infringement_result), ("procedure", procedure_result),
                           ("moot", moot_result), ("financial", financial_result), ("precedent", precedent_result), ("evidence", evidence_result)]:
                 st.session_state[f"{k}_{case_id}"] = v
+
+            # ── 保存到数据库 ──
+            db.add(ScoreSnapshot(case_id=case_id, legal_score=legal_score, business_score=business_score,
+                evidence_score=evidence_score, confidence_score=70, final_score=final_score, recommendation=rec['recommendation']))
             db.commit()
 
-            progress.progress(99, "生成报告...")
+            # ── 生成报告 ──
             report_md = generate_markdown_report(
                 {"name": case.name, "cause_type": case.cause_type, "goal_type": case.goal_type, "client_org": case.client_org},
                 {"legal_feasibility": legal_score, "business_expectation": business_score, "evidence_readiness": evidence_score,
@@ -726,9 +563,266 @@ elif page == "评估分析":
             generate_all_queries(case_id, case.case_description, deepseek_results)
 
             progress.progress(100, "评估完成！")
-            st.success("三维评估全部完成！请前往「评估报告」查看下载")
-            st.info("北大法宝检索计划已生成。回复'帮我检索案件 [ID]'让 AI 助手完成法律数据库查询。")
-            st.balloons()
+            st.success("三维评估全部完成！请查看下方分页结果")
+            st.info("评估报告已生成，前往「评估报告」页面可下载。")
+            st.rerun()
+
+        # ════════════════════════════════════════════════════
+        # 评估结果展示 — Tab 分页
+        # ════════════════════════════════════════════════════
+        if eval_data:
+            st.markdown("---")
+
+            tab_rights, tab_infr, tab_proc, tab_moot, tab_biz, tab_evid, tab_final = st.tabs([
+                "1.1 权利基础", "1.2 侵权认定", "1.3 诉讼程序",
+                "1.4 模拟法庭", "2 业务预期", "3 证据就绪度", "综合评分"
+            ])
+
+            rights_r = eval_data["rights"]
+            infr_r = eval_data["infringement"]
+            proc_r = eval_data["procedure"]
+            moot_r = eval_data["moot"]
+            fin_r = eval_data["financial"]
+            prec_r = eval_data["precedent"]
+            evid_r = eval_data["evidence"]
+            legal_s = eval_data["legal_score"]
+            biz_s = eval_data["business_score"]
+            evid_s = eval_data["evidence_score"]
+            final_s = eval_data["final_score"]
+            rec_data = eval_data["recommendation"]
+            coeff = eval_data["correction_coeff"]
+
+            # ── Tab 1: 权利基础 ──
+            with tab_rights:
+                sub_scores = []
+                for k, v in rights_r.get('sub_scores', {}).items():
+                    label = {"validity":"商标有效性","usage_continuity":"连续使用","coverage":"覆盖范围","well_known_status":"驰名地位","risk_of_invalidation":"无效风险"}.get(k, k)
+                    sub_scores.append({"name": label, "score": v, "status": "pass" if v >= 60 else "warning"})
+                dim_card("1.1 权利基础评估", rights_r.get('score', 0),
+                         rights_r.get('analysis', ''), sub_items=sub_scores,
+                         extra="优势: " + ", ".join(rights_r.get('strengths', ['-'])) + "\n\n风险: " + ", ".join(rights_r.get('risks', ['-'])))
+
+                with st.expander("北大法宝 · 法条检索（验证权利基础）"):
+                    pkulaw_rights = get_dimension_results(case_id, "1.1_权利基础")
+                    if pkulaw_rights:
+                        for law in pkulaw_rights.get("laws", [])[:3]:
+                            st.markdown(f"**{law.get('title', law.get('name',''))}**")
+                            st.caption(law.get('content', law.get('text',''))[:300])
+                    else:
+                        st.info("尚未检索。评估完成后，让 AI 助手通过北大法宝检索验证。")
+
+            # ── Tab 2: 侵权认定 ──
+            with tab_infr:
+                el_items = [{"name": el['name'], "score": el['score'], "status": el.get('status','pass'), "detail": el.get('analysis','')} for el in infr_r.get('elements', [])]
+                dim_card("1.2 侵权认定评估", infr_r.get('score', 0),
+                         infr_r.get('analysis', ''), sub_items=el_items)
+
+                with st.expander("北大法宝 · 类案检索（验证侵权认定标准）"):
+                    pkulaw_inf = get_dimension_results(case_id, "1.2_侵权认定")
+                    if pkulaw_inf:
+                        for c in pkulaw_inf.get("cases", [])[:3]:
+                            st.markdown(f"**{c.get('title', c.get('name',''))}**")
+                            st.caption(f"{c.get('court','')} | {c.get('date','')}")
+                    else:
+                        st.info("尚未检索。评估完成后，让 AI 助手通过北大法宝检索验证。")
+
+            # ── Tab 3: 诉讼程序 ──
+            with tab_proc:
+                proc_items = [{"name": p['name'], "status": p.get('status','pass'), "detail": p.get('detail','')} for p in proc_r.get('items', [])]
+                dim_card("1.3 诉讼程序审查", proc_r.get('score', 0),
+                         proc_r.get('analysis', ''), sub_items=proc_items)
+
+                with st.expander("北大法宝 · 法条检索（验证诉讼程序依据）"):
+                    pkulaw_proc = get_dimension_results(case_id, "1.3_诉讼程序")
+                    if pkulaw_proc:
+                        for law in pkulaw_proc.get("laws", [])[:3]:
+                            st.markdown(f"**{law.get('title', law.get('name',''))}**")
+                            st.caption(law.get('content', law.get('text',''))[:300])
+                    else:
+                        st.info("尚未检索。评估完成后，让 AI 助手通过北大法宝检索验证。")
+
+            # ── Tab 4: 模拟法庭 ──
+            with tab_moot:
+                if moot_r.get("error") and not moot_r.get("rounds"):
+                    st.warning(f"模拟法庭异常: {moot_r.get('error', '')[:200]}")
+                else:
+                    defense_strength = moot_r.get('defense_strength', 50)
+                    coeff_color = COLORS["danger"] if coeff < 0.9 else COLORS["warning"] if coeff < 1.0 else COLORS["success"]
+
+                    col_c1, col_c2 = st.columns(2)
+                    with col_c1:
+                        metric_card("对抗修正系数", f"{coeff:.2f}",
+                                    "被告抗辩有效削弱原告论证" if coeff < 1.0 else "原告论证在对抗中成立", coeff_color)
+                    with col_c2:
+                        metric_card("被告抗辩强度", f"{defense_strength}/100",
+                                    "抗辩有力" if defense_strength >= 60 else "抗辩一般" if defense_strength >= 40 else "抗辩薄弱",
+                                    COLORS["warning"])
+
+                    # 争议焦点
+                    focus_points = moot_r.get('focus_points', [])
+                    if focus_points:
+                        st.markdown(f"""
+                        <div class="card" style="border-left:4px solid {COLORS['accent']};">
+                            <div style="font-weight:700;color:{COLORS['text_dark']};margin-bottom:10px;text-transform:uppercase;letter-spacing:0.05em;font-size:0.85rem;">争议焦点</div>
+                            {"".join(f'<div style="font-size:0.85rem;color:#333;margin-bottom:6px;">{i+1}. {fp}</div>' for i, fp in enumerate(focus_points))}
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                    # 庭审记录
+                    rounds = moot_r.get('rounds', [])
+                    if rounds:
+                        st.markdown(f"""
+                        <div style="font-size:1.1rem;font-weight:800;color:{COLORS['text_dark']};margin-bottom:12px;letter-spacing:-0.02em;">
+                            庭审记录（共{len(rounds)}轮发言）
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                        for rnd in rounds:
+                            role = rnd.get('role', rnd.get('speaker', ''))
+                            role_name = rnd.get('role_name', role)
+                            step_name = rnd.get('step_name', '')
+                            content = rnd.get('content', '')
+
+                            if 'plaintiff' in str(role) or '原告' in str(role_name):
+                                role_type = "plaintiff"
+                            elif 'defendant' in str(role) or '被告' in str(role_name):
+                                role_type = "defendant"
+                            else:
+                                role_type = "judge"
+                            chat_bubble(role_name, step_name, content, role_type)
+
+                    # 法官评分
+                    judge_scores = moot_r.get('judge_scores', {})
+                    if judge_scores and judge_scores.get('plaintiff'):
+                        st.markdown(f"""
+                        <div style="font-size:1.1rem;font-weight:800;color:{COLORS['text_dark']};margin:16px 0 12px;letter-spacing:-0.02em;">
+                            法官评分对比
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                        p_scores = judge_scores.get('plaintiff', {})
+                        d_scores = judge_scores.get('defendant', {})
+
+                        col_p, col_d = st.columns(2)
+                        with col_p:
+                            st.markdown(f"""
+                            <div style="border:1px solid {COLORS['primary']};border-left:3px solid {COLORS['primary']};padding:10px 16px;margin-bottom:12px;">
+                                <div style="font-weight:700;color:{COLORS['primary']};font-size:0.8rem;text-transform:uppercase;letter-spacing:0.05em;">原告论证强度</div>
+                            </div>
+                            """, unsafe_allow_html=True)
+                            label_map = {"rights":"权利基础","infringement":"侵权认定","evidence":"证据体系","legal_application":"法律适用","claim_reasonableness":"诉求合理性"}
+                            for k, v in p_scores.items():
+                                score_bar(label_map.get(k, k), v, COLORS["primary"])
+
+                        with col_d:
+                            st.markdown(f"""
+                            <div style="border:1px solid {COLORS['danger']};border-left:3px solid {COLORS['danger']};padding:10px 16px;margin-bottom:12px;">
+                                <div style="font-weight:700;color:{COLORS['danger']};font-size:0.8rem;text-transform:uppercase;letter-spacing:0.05em;">被告抗辩强度</div>
+                            </div>
+                            """, unsafe_allow_html=True)
+                            d_label_map = {"fact_defense":"事实抗辩","legal_defense":"法律抗辩","evidence_challenge":"证据质疑","alternative_explanation":"替代解释","procedural_defense":"程序抗辩"}
+                            for k, v in d_scores.items():
+                                score_bar(d_label_map.get(k, k), v, COLORS["danger"])
+
+                        reasoning = judge_scores.get('coefficient_reasoning', '')
+                        if reasoning:
+                            st.info(f"**修正系数推理**: {reasoning}")
+
+                    # 薄弱环节
+                    weak_points = moot_r.get('weak_points', [])
+                    if weak_points:
+                        st.markdown(f"""
+                        <div class="card" style="border-left:4px solid {COLORS['danger']};">
+                            <div style="font-weight:700;color:{COLORS['text_dark']};margin-bottom:10px;text-transform:uppercase;letter-spacing:0.05em;font-size:0.85rem;">对抗暴露的薄弱环节</div>
+                            {"".join(f'<div style="font-size:0.85rem;color:#333;margin-bottom:6px;">— {wp}</div>' for wp in weak_points)}
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                    st.caption(f"维度一 法律可行性综合得分: {legal_s} 分（权利 × 侵权 × 程序 × 对抗修正 {coeff:.2f}）")
+
+            # ── Tab 5: 业务预期 ──
+            with tab_biz:
+                section_banner("维度二：业务预期", f"目标：{case.goal_type} · 回答「值不值得诉」", COLORS["warning"])
+
+                fin_score = fin_r.get('score', 50)
+                de = fin_r.get('damages_estimate', {})
+                te = fin_r.get('time_estimate', {})
+                fin_extra = []
+                if de:
+                    fin_extra.append(f"判赔预测: P10=¥{de.get('p10','-')} / P50=¥{de.get('p50','-')} / P90=¥{de.get('p90','-')}")
+                fin_extra.append(f"预估成本: ¥{fin_r.get('cost_estimate','-')}")
+                if te:
+                    fin_extra.append(f"时间: 一审{te.get('first_instance_months','-')}月 + 二审{te.get('second_instance_months','-')}月 + 执行{te.get('enforcement_months','-')}月")
+                fin_extra.append(f"回款概率: {fin_r.get('recovery_probability','-')}%")
+                dim_card("2.1 财务回报评估", fin_score, fin_r.get('analysis', ''), extra="\n".join(fin_extra))
+
+                prec_score = prec_r.get('score', 50)
+                dim_card("2.2 判例价值评估", prec_score, prec_r.get('analysis', ''),
+                         extra=f"首案指数: {prec_r.get('first_case_index','-')} | 影响力级别: {prec_r.get('influence_level','-')}")
+
+                with st.expander("北大法宝 · 首案检索（判例价值主力引擎）"):
+                    pkulaw_prec = get_dimension_results(case_id, "2.2_判例价值")
+                    if pkulaw_prec:
+                        for c in pkulaw_prec.get("cases", [])[:5]:
+                            st.markdown(f"**{c.get('title', c.get('name',''))}**")
+                            st.caption(f"{c.get('court','')} | {c.get('date','')} | {c.get('summary','')[:150] if c.get('summary') else ''}")
+                    else:
+                        st.info("尚未检索。评估完成后，让 AI 助手通过北大法宝检索同类在先判决。")
+
+                st.success(f"维度二 业务预期综合得分: {biz_s} 分")
+                if case.goal_type == "要钱":
+                    st.caption(f"公式: 0.9×财务({fin_score}) + 0.1×判例({prec_score}) = {biz_s}")
+                else:
+                    st.caption(f"公式: 0.1×财务({fin_score}) + 0.9×判例({prec_score}) = {biz_s}")
+
+            # ── Tab 6: 证据就绪度 ──
+            with tab_evid:
+                section_banner("维度三：证据就绪度", "回答「现在能不能诉」", COLORS["success"])
+
+                ev_items = [{"name": m['requirement'], "status": m.get('status','不足'), "detail": m.get('analysis','')} for m in evid_r.get('evidence_matrix', [])]
+                dim_card("证据就绪度评估", evid_r.get('score', 60), evid_r.get('analysis', ''),
+                         sub_items=ev_items,
+                         extra="补证建议: " + ("; ".join(evid_r.get('remediation_suggestions', ['无']))) + "\n\n取证技术建议: " + evid_r.get('collection_advice', '根据证据类型自行判断'))
+
+                st.success(f"维度三 证据就绪度得分: {evid_s} 分")
+
+            # ── Tab 7: 综合评分 ──
+            with tab_final:
+                rec_color = {"green": COLORS["success"], "yellow": COLORS["warning"], "red": COLORS["danger"], "block": COLORS["danger"]}.get(rec_data['level'], COLORS["success"])
+                final_score_card(final_s, rec_data['recommendation'], rec_data['reason'], rec_color)
+
+                col_bars, col_radar = st.columns([1, 1])
+                with col_bars:
+                    st.markdown("##### 各维度得分")
+                    score_bar("法律可行性", legal_s, COLORS["primary"], "权利 × 侵权 × 程序 × 对抗修正")
+                    score_bar("业务预期", biz_s, COLORS["warning"], "要钱/要名自适应加权")
+                    score_bar("证据就绪度", evid_s, COLORS["success"], "证据完整性与补证")
+                    st.markdown(f"**乘法模型**: {legal_s} × {biz_s} × {evid_s} = **{final_s}**")
+                    st.caption(f"对抗修正系数: {coeff:.2f} · 一票否决逻辑")
+
+                with col_radar:
+                    st.markdown("##### 三维雷达图")
+                    radar_html = render_radar_html({
+                        "法律可行性": legal_s,
+                        "业务预期": biz_s,
+                        "证据就绪度": evid_s
+                    })
+                    st.markdown(radar_html, unsafe_allow_html=True)
+
+                # 北大法宝验证
+                with st.expander("北大法宝 · 法条与案号验证"):
+                    valid_status = get_validation_status(case_id)
+                    col_v1, col_v2, col_v3 = st.columns(3)
+                    with col_v1:
+                        metric_card("法条验证", "通过" if valid_status["provisions_validated"] else "待验证", "")
+                    with col_v2:
+                        metric_card("法规识别", "通过" if valid_status["laws_validated"] else "待验证", "")
+                    with col_v3:
+                        metric_card("案号识别", "通过" if valid_status["cases_validated"] else "待验证", "")
+                    if not all([valid_status["provisions_validated"], valid_status["laws_validated"], valid_status["cases_validated"]]):
+                        st.warning("评估完成后，请让 AI 助手运行北大法宝验证，确保法条和案号引用真实有效")
+
+                st.info("评估报告已生成，前往「评估报告」页面查看和下载完整报告。")
 
     finally:
         db.close()
@@ -817,6 +911,22 @@ elif page == "模拟法庭":
                 wp_count = len(moot_result.get('weak_points', []))
                 metric_card("暴露薄弱环节", f"{wp_count} 项", "需关注补强", COLORS["danger"])
 
+            # 庭审步骤进度条
+            step_names = ["开庭陈述", "被告答辩", "举证质证", "法庭辩论", "法官归纳"]
+            step_nums = [1, 2, 3, 4, 5]
+            st.markdown(f"""
+            <div style="margin:20px 0;padding:16px 0;border-top:1px solid #e5e5e5;border-bottom:1px solid #e5e5e5;">
+                <div style="display:flex;justify-content:space-between;align-items:center;">
+                    {"".join(f'''
+                    <div style="flex:1;text-align:center;position:relative;">
+                        <div style="width:32px;height:32px;border:2px solid {'#0d1429' if i < len(rounds) else '#e5e5e5'};border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font-size:0.8rem;font-weight:700;color:{'#0d1429' if i < len(rounds) else '#ccc'};background:{'#0d1429' if i < len(rounds) else 'transparent'};">{f'<span style="color:#fff;">{i+1}</span>' if i < len(rounds) else i+1}</div>
+                        <div style="font-size:0.72rem;color:{'#0d1429' if i < len(rounds) else '#ccc'};margin-top:6px;font-weight:{'600' if i < len(rounds) else '400'};">{s}</div>
+                    </div>{'<div style="flex:0.3;height:2px;background:#0d1429;"></div>' if i < 4 else ''}
+                    ''' for i, s in enumerate(step_names))}
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
             # 争议焦点
             focus_points = moot_result.get('focus_points', [])
             if focus_points:
@@ -827,7 +937,7 @@ elif page == "模拟法庭":
                 </div>
                 """, unsafe_allow_html=True)
 
-            # 庭审对话
+            # 庭审记录 — 按步骤分组显示
             st.markdown("")
             st.markdown(f"""
             <div style="font-size:1.1rem;font-weight:800;color:{COLORS['text_dark']};margin-bottom:12px;letter-spacing:-0.02em;">
@@ -835,11 +945,23 @@ elif page == "模拟法庭":
             </div>
             """, unsafe_allow_html=True)
 
+            current_step = None
             for rnd in rounds:
                 role = rnd.get('role', rnd.get('speaker', ''))
                 role_name = rnd.get('role_name', role)
                 step_name = rnd.get('step_name', '')
                 content = rnd.get('content', '')
+                step_num = rnd.get('step', 0)
+
+                # 步骤分隔线 + 步骤标题
+                if step_num != current_step:
+                    current_step = step_num
+                    step_label_map = {1: "第一步 · 开庭陈述", 2: "第二步 · 被告答辩", 3: "第三步 · 举证质证", 4: "第四步 · 法庭辩论", 5: "第五步 · 法官归纳"}
+                    st.markdown(f"""
+                    <div style="margin:20px 0 8px 0;padding:8px 0;border-bottom:2px solid #0d1429;">
+                        <span style="font-size:0.9rem;font-weight:700;color:#0d1429;letter-spacing:-0.01em;">{step_label_map.get(step_num, step_name)}</span>
+                    </div>
+                    """, unsafe_allow_html=True)
 
                 if 'plaintiff' in str(role) or '原告' in str(role_name):
                     role_type = "plaintiff"
@@ -848,6 +970,16 @@ elif page == "模拟法庭":
                 else:
                     role_type = "judge"
                 chat_bubble(role_name, step_name, content, role_type)
+
+            # 法官归纳摘要 — 高亮显示
+            judge_summary = moot_result.get('judge_summary', '')
+            if judge_summary:
+                st.markdown(f"""
+                <div class="card" style="border:2px solid {COLORS['accent']};margin-top:20px;">
+                    <div style="font-size:0.72rem;color:{COLORS['accent']};text-transform:uppercase;letter-spacing:0.1em;margin-bottom:8px;font-weight:600;">法官最终归纳</div>
+                    <div style="font-size:0.88rem;color:#333;line-height:1.8;">{judge_summary}</div>
+                </div>
+                """, unsafe_allow_html=True)
 
             # 法官评分对比
             judge_scores = moot_result.get('judge_scores', {})
@@ -861,27 +993,35 @@ elif page == "模拟法庭":
 
                 p_scores = judge_scores.get('plaintiff', {})
                 d_scores = judge_scores.get('defendant', {})
+                p_detail = judge_scores.get('plaintiff_detail', {})
+                d_detail = judge_scores.get('defendant_detail', {})
 
                 col_p, col_d = st.columns(2)
                 with col_p:
+                    p_avg = sum(p_scores.values()) / len(p_scores) if p_scores else 0
                     st.markdown(f"""
-                    <div style="border:1px solid {COLORS['primary']};border-left:3px solid {COLORS['primary']};padding:10px 16px;margin-bottom:12px;">
+                    <div style="border:1px solid {COLORS['primary']};border-left:3px solid {COLORS['primary']};padding:10px 16px;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center;">
                         <div style="font-weight:700;color:{COLORS['primary']};font-size:0.8rem;text-transform:uppercase;letter-spacing:0.05em;">原告论证强度</div>
+                        <div style="font-size:1.4rem;font-weight:800;color:{COLORS['primary']};">{p_avg:.0f}</div>
                     </div>
                     """, unsafe_allow_html=True)
                     label_map = {"rights":"权利基础","infringement":"侵权认定","evidence":"证据体系","legal_application":"法律适用","claim_reasonableness":"诉求合理性"}
                     for k, v in p_scores.items():
-                        score_bar(label_map.get(k, k), v, COLORS["primary"])
+                        detail = p_detail.get(k, "")
+                        score_bar(label_map.get(k, k), v, COLORS["primary"], detail)
 
                 with col_d:
+                    d_avg = sum(d_scores.values()) / len(d_scores) if d_scores else 0
                     st.markdown(f"""
-                    <div style="border:1px solid {COLORS['danger']};border-left:3px solid {COLORS['danger']};padding:10px 16px;margin-bottom:12px;">
+                    <div style="border:1px solid {COLORS['danger']};border-left:3px solid {COLORS['danger']};padding:10px 16px;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center;">
                         <div style="font-weight:700;color:{COLORS['danger']};font-size:0.8rem;text-transform:uppercase;letter-spacing:0.05em;">被告抗辩强度</div>
+                        <div style="font-size:1.4rem;font-weight:800;color:{COLORS['danger']};">{d_avg:.0f}</div>
                     </div>
                     """, unsafe_allow_html=True)
                     d_label_map = {"fact_defense":"事实抗辩","legal_defense":"法律抗辩","evidence_challenge":"证据质疑","alternative_explanation":"替代解释","procedural_defense":"程序抗辩"}
                     for k, v in d_scores.items():
-                        score_bar(d_label_map.get(k, k), v, COLORS["danger"])
+                        detail = d_detail.get(k, "")
+                        score_bar(d_label_map.get(k, k), v, COLORS["danger"], detail)
 
                 reasoning = judge_scores.get('coefficient_reasoning', '')
                 if reasoning:

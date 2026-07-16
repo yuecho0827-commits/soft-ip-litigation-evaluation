@@ -1,274 +1,241 @@
 """
 Mock LLM 模块 - MVP 阶段使用模拟数据
-后续可无缝切换到真实 DeepSeek API
+函数签名和返回结构与 llm_client.py 完全一致
+切换到真实模式时只需修改 config.py 中 USE_MOCK = False
 """
 
 import time
 from typing import Dict, List, Any
-from datetime import datetime
+
 
 def mock_delay():
     """模拟 LLM 响应延迟"""
     time.sleep(1)
 
-def extract_case_facts(case_description: str) -> Dict[str, Any]:
+
+# ============================================================
+# 维度一：法律可行性
+# ============================================================
+
+def evaluate_rights_foundation(
+    case_description: str,
+    party_info: str = "",
+    uploaded_texts: str = ""
+) -> Dict[str, Any]:
     """
-    从案情描述中提取关键事实
-    Mock 模式：返回模拟数据
+    子维度 1.1：权利基础评估
+    评估商标权的有效性、使用情况、撤三风险、跨类保护可能性
+    Mock 模式：返回模拟评分数据
     """
     mock_delay()
 
     return {
-        "parties": [
-            {"role": "plaintiff", "name": "某知名品牌公司", "type": "company"},
-            {"role": "defendant", "name": "某电商平台商家", "type": "company"}
+        "score": 82,
+        "sub_scores": {
+            "validity": 90,
+            "usage_continuity": 85,
+            "coverage": 75,
+            "well_known_status": 70,
+            "risk_of_invalidation": 80
+        },
+        "analysis": (
+            "原告商标经合法注册，处于有效期内，权利基础较为牢固。"
+            "商标已连续使用超过三年，不存在撤三风险。"
+            "核定使用商品覆盖第25类服装等，与被诉侵权商品属于同类商品。"
+            "商标具有一定知名度但尚未达到驰名商标认定标准，跨类保护力度有限。"
+            "总体而言，权利基础稳固，可支撑侵权主张。"
+        ),
+        "strengths": [
+            "商标注册证齐全，有效期内的合法注册商标",
+            "连续使用超过三年，无撤三风险",
+            "核定使用商品与侵权商品属于同一类别"
         ],
-        "timeline": [
-            {"date": "2020-01-01", "event": "原告注册商标"},
-            {"date": "2023-01-01", "event": "发现被告侵权行为"},
-            {"date": "2023-06-01", "event": "发送律师函"}
+        "risks": [
+            "尚未达到驰名商标标准，跨类保护力度有限",
+            "部分核定商品项目与实际使用存在偏差"
         ],
-        "key_facts": [
-            "被告在电商平台上销售假冒原告注册商标的商品",
-            "侵权商品销售额约为 50 万元",
-            "原告商标为驰名商标，具有较高知名度"
-        ],
-        "evidence_checklist": {
-            "has_rights_proof": True,
-            "has_infringement_proof": True,
-            "has_damage_proof": False
-        }
+        "error": None
     }
 
-def analyze_legal_elements(case_facts: Dict) -> Dict[str, Any]:
+
+def evaluate_infringement(
+    case_description: str,
+    rights_assessment: str = "",
+    uploaded_texts: str = ""
+) -> Dict[str, Any]:
     """
-    分析法律构成要件
-    Mock 模式：返回模拟评分
+    子维度 1.2：侵权认定评估（单方视角）
+    分析商标侵权构成要件：商标性使用、商品类似性、商标近似性、混淆可能性、正当使用
+    Mock 模式：返回模拟评分数据
     """
     mock_delay()
 
     return {
+        "score": 75,
         "elements": [
             {
-                "element": "权利基础",
+                "name": "商标性使用",
                 "score": 85,
-                "analysis": "原告持有有效注册商标，权利基础牢固",
-                "evidence_status": "充足",
-                "risks": []
+                "status": "pass",
+                "analysis": "被告将涉嫌侵权的标识突出使用在商品标签、店铺名称和商品详情页中，起到了识别商品来源的功能，构成商标性使用。"
             },
             {
-                "element": "侵权认定",
-                "score": 75,
-                "analysis": "被告行为构成商标侵权，但相似度认定存在一定争议",
-                "evidence_status": "部分充足",
-                "risks": ["商品类似程度认定可能有争议"]
+                "name": "商品类似性",
+                "score": 80,
+                "status": "pass",
+                "analysis": "被诉商品与原告核定使用的商品在功能、用途、生产部门、销售渠道、消费对象等方面高度重合，构成同一种商品。"
             },
             {
-                "element": "赔偿依据",
-                "score": 60,
-                "analysis": "缺乏明确的损害赔偿计算依据",
-                "evidence_status": "不足",
-                "risks": ["赔偿额难以获得法院全额支持"]
+                "name": "商标近似性",
+                "score": 72,
+                "status": "warning",
+                "analysis": "被诉标识与原告注册商标在字形结构上有一定相似性，但在整体视觉上存在差异。近似性认定有一定争议空间，建议进行专业的商标对比分析。"
+            },
+            {
+                "name": "混淆可能性",
+                "score": 65,
+                "status": "warning",
+                "analysis": "一般消费者在施以普通注意力的情况下可能产生混淆，但目前缺乏消费者混淆的实际证据。建议补充消费者混淆调查报告以加强论证。"
+            },
+            {
+                "name": "正当使用排除",
+                "score": 88,
+                "status": "pass",
+                "analysis": "被告将标识用作商标性使用而非描述性使用，不适用《商标法》第59条的正当使用抗辩。被告的使用行为不属于合理使用情形。"
             }
         ],
-        "overall_legal_feasibility": 73
+        "analysis": (
+            "综合五要件分析，被告行为基本构成商标侵权。"
+            "商标性使用和商品类似性认定较为明确，正当使用抗辩不成立。"
+            "主要争议集中在商标近似性和混淆可能性两个要件上，"
+            "建议通过商标对比分析报告和消费者混淆调查加强论证。"
+        ),
+        "risks": [
+            "商标近似性认定存在争议，被告可能主张标识差异",
+            "缺乏消费者混淆的实际证据，混淆可能性论证不够充分"
+        ],
+        "error": None
     }
 
-def check_rules(case_facts: Dict) -> List[Dict[str, Any]]:
-    """
-    规则检查（红线检查）
-    Mock 模式：返回模拟结果
-    """
-    mock_delay()
 
-    return [
-        {
-            "rule_code": " statute_of_limitations",
-            "rule_name": "诉讼时效检查",
-            "severity": "pass",
-            "result": "未发现时效问题",
-            "reason": "侵权行为在诉讼时效内"
-        },
-        {
-            "rule_code": "subject_qualification",
-            "rule_name": "主体资格检查",
-            "severity": "pass",
-            "result": "原告主体资格完整",
-            "reason": "原告为注册商标持有人"
-        },
-        {
-            "rule_code": "arbitration_clause",
-            "rule_name": "仲裁协议检查",
-            "severity": "pass",
-            "result": "未发现仲裁协议",
-            "reason": "原被告之间无仲裁协议"
-        },
-        {
-            "rule_code": "missing_rights_proof",
-            "rule_name": "权利证明缺失检查",
-            "severity": "pass",
-            "result": "权利证明文件齐全",
-            "reason": "已上传商标注册证"
-        },
-        {
-            "rule_code": "missing_infringement_proof",
-            "rule_name": "侵权固定证据缺失检查",
-            "severity": "warning",
-            "result": "侵权证据需要进一步固定",
-            "reason": "公证证据较为简单，建议补充购买记录公证"
-        },
-        {
-            "rule_code": "missing_damage_proof",
-            "rule_name": "损害赔偿证据缺失检查",
-            "severity": "warning",
-            "result": "损害赔偿计算依据不足",
-            "reason": "缺乏被告获利证据或原告损失证据"
-        }
-    ]
-
-def generate_score(case_facts: Dict, legal_analysis: Dict, rule_results: List) -> Dict[str, Any]:
+def evaluate_procedure(
+    case_description: str,
+    party_info: str = ""
+) -> Dict[str, Any]:
     """
-    生成三维评分
-    Mock 模式：返回模拟评分
+    子维度 1.3：诉讼程序审查
+    时效、管辖、主体适格、前置程序
+    Mock 模式：返回模拟评分数据
     """
     mock_delay()
-
-    # 检查是否有 block 级规则命中
-    has_block = any(r["severity"] == "block" for r in rule_results)
-
-    if has_block:
-        return {
-            "legal_feasibility": legal_analysis["overall_legal_feasibility"],
-            "business_expectation": 50,
-            "evidence_readiness": 60,
-            "confidence_score": 40,
-            "final_score": None,
-            "recommendation": "暂不建议起诉",
-            "reason": "存在程序性红线问题"
-        }
-
-    # 计算三维评分
-    legal_score = legal_analysis["overall_legal_feasibility"]
-    business_score = 65  # Mock: 赔偿预期中等
-    evidence_score = 70  # Mock: 证据基本就绪
-
-    # 加权计算
-    final_score = int(legal_score * 0.45 + business_score * 0.25 + evidence_score * 0.30)
-
-    # 置信度
-    confidence_score = 65
-
-    # 建议
-    if final_score >= 70:
-        recommendation = "建议起诉"
-    elif final_score >= 50:
-        recommendation = "补证后再起诉"
-    else:
-        recommendation = "暂缓起诉"
 
     return {
-        "legal_feasibility": legal_score,
-        "business_expectation": business_score,
-        "evidence_readiness": evidence_score,
-        "confidence_score": confidence_score,
-        "final_score": final_score,
-        "recommendation": recommendation,
-        "reason": f"综合评分 {final_score} 分，{recommendation}。需注意：证据仍需补充，赔偿依据不足。"
+        "score": 88,
+        "items": [
+            {
+                "name": "诉讼时效",
+                "status": "pass",
+                "detail": "侵权行为发生在2023年1月，距今未超过三年诉讼时效，时效审查通过。"
+            },
+            {
+                "name": "管辖权",
+                "status": "pass",
+                "detail": "侵权行为地（被告电商平台服务器所在地）和被告住所地均有管辖权，可选择有利法院。"
+            },
+            {
+                "name": "主体适格",
+                "status": "pass",
+                "detail": "原告为注册商标专用权人，主体资格完整，有权提起诉讼。"
+            },
+            {
+                "name": "仲裁协议",
+                "status": "pass",
+                "detail": "原被告之间不存在有效仲裁协议，可直接向法院起诉。"
+            },
+            {
+                "name": "前置程序",
+                "status": "pass",
+                "detail": "本案不涉及行政处理前置程序，可直接提起民事诉讼。"
+            }
+        ],
+        "analysis": (
+            "诉讼程序审查全部通过，不存在程序性障碍。"
+            "诉讼时效、管辖权、主体资格、仲裁协议和前置程序均无问题，可以正常推进诉讼。"
+        ),
+        "block_items": [],
+        "error": None
     }
 
-def generate_report(case_info: Dict, score_result: Dict, rule_results: List) -> str:
+
+# ============================================================
+# 维度二：业务预期
+# ============================================================
+
+def evaluate_financial_return(
+    case_description: str,
+    infringement_severity: str = "",
+    case_law_references: str = ""
+) -> Dict[str, Any]:
     """
-    生成评估报告（Markdown 格式）
-    Mock 模式：返回模拟报告
+    子维度 2.1：财务回报评估
+    预测判赔区间、诉讼成本和净收益
+    Mock 模式：返回模拟评分数据
     """
     mock_delay()
 
-    report = f"""
-# Soft IP 主诉评估报告
+    return {
+        "score": 60,
+        "damages_estimate": {
+            "p10": "200000",
+            "p50": "500000",
+            "p90": "800000"
+        },
+        "cost_estimate": "80000",
+        "time_estimate": {
+            "first_instance_months": 6,
+            "second_instance_months": 4,
+            "enforcement_months": 3
+        },
+        "recovery_probability": "70",
+        "analysis": (
+            "基于侵权商品销售额约50万元的初步信息，判赔金额预测中位数约50万元。"
+            "考虑到缺乏被告获利直接证据，法院可能适用法定赔偿，判赔金额存在较大不确定性。"
+            "诉讼总成本约8万元（含律师费、公证费、诉讼费），"
+            "一审周期约6个月，二审约4个月，执行约3个月，总周期约13个月。"
+            "回款概率约70%，被告有可供执行的财产。"
+        ),
+        "error": None
+    }
 
-**案件名称**: {case_info.get('name', '未命名案件')}
-**评估时间**: {datetime.now().strftime('%Y-%m-%d %H:%M')}
-**案由**: 商标侵权
-**业务目标**: {case_info.get('goal_type', '未指定')}
 
----
+def evaluate_precedent_value(
+    case_description: str,
+    case_law_references: str = ""
+) -> Dict[str, Any]:
+    """
+    子维度 2.2：判例价值评估
+    评估首案潜力、指导性案例入选概率
+    Mock 模式：返回模拟评分数据
+    """
+    mock_delay()
 
-## 一、结论摘要
+    return {
+        "score": 55,
+        "first_case_index": "中等",
+        "influence_level": "区域影响力",
+        "analysis": (
+            "本案涉及电商平台商标侵权的热点问题，具有一定典型性，"
+            "但尚未达到首案级别。案件在电商商标侵权认定标准、"
+            "赔偿计算方式方面有一定参考价值，但整体影响力限于区域内。"
+            "如能在赔偿计算或驰名商标认定方面有突破，判例价值可进一步提升。"
+        ),
+        "error": None
+    }
 
-**总体建议**: {score_result['recommendation']}
-**综合评分**: {score_result['final_score']} 分（满分100分）
-**置信度**: {score_result['confidence_score']}%
 
-{score_result['reason']}
-
----
-
-## 二、三维评分总览
-
-| 维度 | 得分 | 权重 | 加权得分 |
-|------|------|------|---------|
-| 法律可行性 | {score_result['legal_feasibility']} | 45% | {score_result['legal_feasibility'] * 0.45:.1f} |
-| 业务预期 | {score_result['business_expectation']} | 25% | {score_result['business_expectation'] * 0.25:.1f} |
-| 证据就绪度 | {score_result['evidence_readiness']} | 30% | {score_result['evidence_readiness'] * 0.30:.1f} |
-
----
-
-## 三、红线风险检查
-
-"""
-
-    for rule in rule_results:
-        status_icon = "✅" if rule["severity"] == "pass" else ("⚠️" if rule["severity"] == "warning" else "🚫")
-        report += f"\n### {status_icon} {rule['rule_name']}\n"
-        report += f"**结果**: {rule['result']}\n"
-        report += f"**说明**: {rule['reason']}\n"
-
-    report += """
----
-
-## 四、证据矩阵诊断
-
-### 权利基础证据
-- ✅ 商标注册证（已上传）
-- ✅ 续展证明（有效期内）
-
-### 侵权认定证据
-- ✅ 侵权商品截图（已公证）
-- ⚠️ 购买记录公证（建议补充）
-- ⚠️ 侵权商品实物（建议补充）
-
-### 损害赔偿证据
-- ❌ 被告获利证据（缺失）
-- ❌ 原告损失证据（缺失）
-- ⚠️ 许可费证据（可补充）
-
----
-
-## 五、建议行动方案
-
-1. **立即补充证据**:
-   - 对侵权商品进行购买公证
-   - 收集被告销售数据（可申请法院调取）
-   - 准备商标知名度证据（获奖记录、广告投入等）
-
-2. **法律策略建议**:
-   - 重点论证商标近似性和商品类似性
-   - 准备驰名商标认定材料（如需要）
-   - 考虑申请行为保全（禁令）
-
-3. **风险提示**:
-   - 赔偿额可能低于预期，建议调整预期
-   - 被告可能提出商标不侵权抗辩，需提前准备反驳证据
-
----
-
-## 六、附录
-
-**评估模型版本**: v0.1.0 MVP
-**Disclaimer**: 本报告为 AI 辅助生成，仅供内部决策参考，不构成法律意见。
-"""
-
-    return report
+# ============================================================
+# 维度三：证据就绪度
+# ============================================================
 
 def evaluate_evidence_readiness(
     case_description: str,
@@ -276,7 +243,7 @@ def evaluate_evidence_readiness(
     evidence_count: int = 0
 ) -> Dict[str, Any]:
     """
-    证据就绪度评估（Mock 模式）
+    证据就绪度评估
     返回与 llm_client.evaluate_evidence_readiness 相同的结构
     """
     mock_delay()
@@ -288,28 +255,32 @@ def evaluate_evidence_readiness(
                 "requirement": "权利基础证据",
                 "standard_evidence": "商标注册证/续展证明/使用证据",
                 "status": "充足",
-                "analysis": "原告已上传商标注册证，权利基础证据完整"
+                "analysis": "原告已上传商标注册证，权利基础证据完整，商标处于有效期内。"
             },
             {
                 "requirement": "侵权认定证据",
                 "standard_evidence": "侵权截图/购买取证/公证文书",
                 "status": "不足",
-                "analysis": "已有公证购买和页面截图，但缺少侵权商品实物比对"
+                "analysis": "已有公证购买和页面截图，但缺少侵权商品实物比对和消费者混淆调查报告。"
             },
             {
                 "requirement": "损害赔偿证据",
                 "standard_evidence": "被告获利/原告损失/许可费",
                 "status": "缺失",
-                "analysis": "缺乏被告获利直接证据，原告损失计算依据不足"
+                "analysis": "缺乏被告获利直接证据，原告损失计算依据不足，需申请法院调取销售数据。"
             },
             {
                 "requirement": "取证技术规范",
                 "standard_evidence": "可信时间戳/区块链存证/公证",
                 "status": "充足",
-                "analysis": "已采用公证取证方式，符合电子证据规范"
+                "analysis": "已采用公证取证方式，符合电子证据规范要求。"
             }
         ],
-        "analysis": "证据体系框架基本建立，但损害赔偿证据明显缺失，建议在起诉前补充被告获利证据或申请法院调取销售数据",
+        "analysis": (
+            "证据体系框架基本建立，但损害赔偿证据明显缺失。"
+            "权利基础证据和取证技术规范已达标，侵权认定证据需补充，"
+            "损害赔偿证据存在重大缺口。建议在起诉前补充被告获利证据或申请法院调取销售数据。"
+        ),
         "missing_items": [
             "被告实际获利数据",
             "消费者混淆调查报告",
@@ -320,7 +291,8 @@ def evaluate_evidence_readiness(
             "委托第三方机构进行消费者混淆调查",
             "收集商标宣传推广证据以证明知名度"
         ],
-        "collection_advice": "建议采用区块链存证固定后续发现的侵权证据，同时考虑申请法院证据保全"
+        "collection_advice": "建议采用区块链存证固定后续发现的侵权证据，同时考虑申请法院证据保全。",
+        "error": None
     }
 
 
@@ -574,16 +546,3 @@ def run_moot_court_simulation(
         },
         "error": None
     }
-
-
-# 向后兼容别名
-def run_moot_court(case_facts: Dict = None, **kwargs) -> Dict[str, Any]:
-    """向后兼容：旧接口调用转发到新函数"""
-    if isinstance(case_facts, str):
-        return run_moot_court_simulation(case_description=case_facts)
-    return run_moot_court_simulation(
-        case_description=kwargs.get("case_description", ""),
-        rights_assessment=kwargs.get("rights_assessment", ""),
-        infringement_assessment=kwargs.get("infringement_assessment", ""),
-        evidence_summary=kwargs.get("evidence_summary", "")
-    )
