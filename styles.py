@@ -707,13 +707,7 @@ def case_card(case_id, name, cause_type, goal_type, status, score=None, recommen
     score_html = ""
     if score is not None:
         rec_color = COLORS["primary"] if score >= 65 else COLORS["accent"] if score >= 40 else COLORS["danger"]
-        score_html = f"""
-        <div style="display:flex;align-items:baseline;gap:6px;margin-top:10px;">
-            <span style="font-size:2rem;font-weight:800;color:{rec_color};letter-spacing:-0.04em;">{score}</span>
-            <span style="font-size:0.75rem;color:#999;">/ 100</span>
-            {f'<span style="font-size:0.78rem;color:{rec_color};margin-left:8px;font-weight:600;">{recommendation}</span>' if recommendation else ''}
-        </div>
-        """
+        score_html = f'<div style="display:flex;align-items:baseline;gap:6px;margin-top:10px;"><span style="font-size:2rem;font-weight:800;color:{rec_color};letter-spacing:-0.04em;">{score}</span><span style="font-size:0.75rem;color:#999;">/ 100</span>{f"<span style=\"font-size:0.78rem;color:{rec_color};margin-left:8px;font-weight:600;\">{recommendation}</span>" if recommendation else ""}</div>'
 
     st.markdown(f"""
     <div class="case-card">
