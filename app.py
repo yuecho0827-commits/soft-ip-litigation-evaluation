@@ -17,6 +17,11 @@ from config import APP_TITLE, APP_VERSION, USE_MOCK
 from database import init_db, SessionLocal, Case, RuleHit, ScoreSnapshot, Report
 from evidence_parser import parse_pdf, ocr_image, is_pdf_file, is_image_file
 from report_generator import generate_markdown_report, generate_pdf_bytes
+from pkulaw_api import (
+    search_for_rights_foundation, search_for_infringement, search_for_procedure,
+    search_for_moot_court, search_for_financial, search_for_precedent,
+    run_verification_phase, get_linked_content
+)
 from styles import (
     inject_global_css, page_header, section_banner, dim_card,
     score_bar, final_score_card, case_card, chat_bubble,
@@ -523,45 +528,83 @@ elif page == "评估分析":
             section_banner("维度一：法律可行性", "回答「能不能诉」", COLORS["primary"])
 
             # 1.1 权利基础
+            rights_default = {"score": 60, "sub_scores": {}, "analysis": "评估失败", "strengths": [], "risks": ["评估异常"], "red_flag": False}
             progress.progress(8, "1/7 权利基础评估...")
-            with st.spinner("正在分析商标权利基础..."):
-                rights_result = evaluate_rights_foundation(case.case_description, uploaded_texts=evidence_texts)
+            with st.spinner("📚 北大法宝检索法条 → DeepSeek 分析..."):
+                try: pkulaw_rights = search_for_rights_foundation()
+                except: pkulaw_rights = {"laws": [], "cases": []}
+                try:
+                    rights_result = evaluate_rights_foundation(case.case_description, uploaded_texts=evidence_texts, pkulaw_data=pkulaw_rights)
+                except Exception as exc:
+                    rights_result = {"error": str(exc)[:200]}
             if rights_result.get("error"):
-                st.error(f"权利基础评估失败: {rights_result.get('error', '')[:200]}")
-                rights_result = {"score": 0, "sub_scores": {}, "analysis": "", "strengths": [], "risks": [], "error": rights_result.get("error")}
+                st.warning("⚠️ 权利基础异常，使用默认分")
+                rights_result = rights_default
+            sub_scores = [{"name": {"validity":"商标有效性","usage_continuity":"连续使用","coverage":"覆盖范围","well_known_status":"驰名地位","risk_of_invalidation":"无效风险"}.get(k, k),
+                           "score": v, "status": "pass" if v >= 60 else "warning"}
+                          for k, v in rights_result.get('sub_scores', {}).items()]
+            dim_card("1.1 权利基础评估", rights_result.get('score', 0),
+                     rights_result.get('analysis', ''), sub_items=sub_scores,
+                     extra="优势: " + ", ".join(rights_result.get('strengths', ['-'])) + "\n\n风险: " + ", ".join(rights_result.get('risks', ['-'])))
+            st.caption("📚 北大法宝（实时检索）" if rights_result.get("source") == "pkulaw" else "🤖 DeepSeek")
 
             # 1.2 侵权认定
+            inf_default = {"score": 60, "elements": [], "analysis": "评估失败", "strengths": [], "risks": ["评估异常"], "red_flag": False}
             progress.progress(22, "2/7 侵权认定评估...")
-            with st.spinner("正在分析商标侵权五要件..."):
-                infringement_result = evaluate_infringement(case.case_description,
-                    rights_assessment=str(rights_result.get('analysis', '')),
-                    uploaded_texts=evidence_texts)
+            with st.spinner("📚 北大法宝检索类案 → DeepSeek 五要件分析..."):
+                try: pkulaw_inf = search_for_infringement()
+                except: pkulaw_inf = {"laws": [], "cases": []}
+                try:
+                    infringement_result = evaluate_infringement(case.case_description,
+                        rights_assessment=str(rights_result.get('analysis', '')),
+                        uploaded_texts=evidence_texts, pkulaw_data=pkulaw_inf)
+                except Exception as exc:
+                    infringement_result = {"error": str(exc)[:200]}
             if infringement_result.get("error"):
-                st.error(f"侵权认定失败: {infringement_result.get('error', '')[:200]}")
-                infringement_result = {"score": 0, "elements": [], "analysis": "", "risks": [], "error": infringement_result.get("error")}
+                st.warning("⚠️ 侵权认定异常，使用默认分")
+                infringement_result = inf_default
+            el_items = [{"name": el['name'], "score": el['score'], "status": el.get('status','pass'), "detail": el.get('analysis','')} for el in infringement_result.get('elements', [])]
+            dim_card("1.2 侵权认定评估", infringement_result.get('score', 0),
+                     infringement_result.get('analysis', ''), sub_items=el_items)
+            st.caption("📚 北大法宝（实时检索）" if infringement_result.get("source") == "pkulaw" else "🤖 DeepSeek")
 
             # 1.3 诉讼程序
+            proc_default = {"score": 60, "items": [], "analysis": "评估失败", "block_items": [], "red_flag": False}
             progress.progress(36, "3/7 程序审查...")
-            with st.spinner("正在审查诉讼时效、管辖仲裁、主体适格..."):
-                procedure_result = evaluate_procedure(case.case_description)
+            with st.spinner("📚 北大法宝检索程序法条 → DeepSeek 审查..."):
+                try: pkulaw_proc = search_for_procedure()
+                except: pkulaw_proc = {"laws": [], "cases": []}
+                try:
+                    procedure_result = evaluate_procedure(case.case_description, party_info=case.client_org or "", pkulaw_data=pkulaw_proc)
+                except Exception as exc:
+                    procedure_result = {"error": str(exc)[:200]}
             if procedure_result.get("error"):
-                st.error(f"程序审查失败: {procedure_result.get('error', '')[:200]}")
-                procedure_result = {"score": 0, "items": [], "analysis": "", "block_items": [], "error": procedure_result.get("error")}
+                st.warning("⚠️ 程序审查异常，使用默认分")
+                procedure_result = proc_default
+            proc_items = [{"name": p['name'], "status": p.get('status','pass'), "detail": p.get('detail','')} for p in procedure_result.get('items', [])]
+            dim_card("1.3 诉讼程序审查", procedure_result.get('score', 0),
+                     procedure_result.get('analysis', ''), sub_items=proc_items)
+            st.caption("📚 北大法宝（实时检索）" if procedure_result.get("source") == "pkulaw" else "🤖 DeepSeek")
 
             # 1.4 模拟法庭
+            moot_default = {"correction_coefficient": 1.0, "rounds": [], "judge_summary": "模拟法庭异常"}
             progress.progress(50, "4/7 模拟法庭对抗检验...")
             section_banner("1.4 模拟法庭（多Agent对抗检验）", "原告Agent ↔ 被告Agent ↔ 法官Agent", COLORS["accent"])
-            mode_label = "Mock 模拟" if _mock else "DeepSeek API"
-            with st.spinner(f"正在进行五步庭审模拟（{mode_label}）..."):
-                moot_result = run_moot_court_simulation(case.case_description,
-                    rights_assessment=str(rights_result.get('analysis', '')),
-                    infringement_assessment=str(infringement_result.get('analysis', '')),
-                    evidence_summary=evidence_texts[:1500] if evidence_texts else "")
-
+            with st.spinner("📚 北大法宝检索抗辩模式 → DeepSeek 五步庭审..."):
+                try: pkulaw_moot = search_for_moot_court()
+                except: pkulaw_moot = {"laws": [], "cases": []}
+                try:
+                    moot_result = run_moot_court_simulation(case.case_description,
+                        rights_assessment=str(rights_result.get('analysis', '')),
+                        infringement_assessment=str(infringement_result.get('analysis', '')),
+                        evidence_summary=evidence_texts[:1500] if evidence_texts else "",
+                        pkulaw_data=pkulaw_moot)
+                except Exception as exc:
+                    moot_result = {"error": str(exc)[:200]}
             if moot_result.get("error") and not moot_result.get("rounds"):
-                correction_coeff = 1.0
-            else:
-                correction_coeff = moot_result.get('correction_coefficient', 1.0)
+                st.warning("⚠️ 模拟法庭异常，使用默认系数 1.0")
+                moot_result = moot_default
+            correction_coeff = moot_result.get('correction_coefficient', 1.0)
 
             # 维度一小计
             legal_score = calculate_legal_feasibility(
@@ -570,17 +613,48 @@ elif page == "评估分析":
             )
 
             # ── 维度二：业务预期 ──
+            # 2.1 财务回报
+            fin_default = {"score": 50, "damages_estimate": {}, "cost_estimate": "-", "time_estimate": {}, "recovery_probability": "-", "analysis": "评估失败"}
             progress.progress(64, "5/7 财务回报评估...")
-            with st.spinner("正在预测判赔区间和诉讼成本..."):
-                financial_result = evaluate_financial_return(case.case_description)
+            with st.spinner("📚 北大法宝检索判赔数据 → DeepSeek 预测..."):
+                try: pkulaw_fin = search_for_financial()
+                except: pkulaw_fin = {"laws": [], "cases": []}
+                try:
+                    financial_result = evaluate_financial_return(case.case_description,
+                        infringement_severity=str(infringement_result.get('analysis', '')),
+                        case_law_references="", pkulaw_data=pkulaw_fin)
+                except Exception as exc:
+                    financial_result = {"error": str(exc)[:200]}
             if financial_result.get("error"):
-                financial_result = {"score": 50, "damages_estimate": {}, "cost_estimate": "-", "time_estimate": {}, "recovery_probability": "-", "analysis": "", "error": financial_result.get("error")}
+                st.warning("⚠️ 财务评估异常，使用默认分")
+                financial_result = fin_default
+            fin_score = financial_result.get('score', 50)
+            de = financial_result.get('damages_estimate', {})
+            te = financial_result.get('time_estimate', {})
+            fin_extra = []
+            if de: fin_extra.append(f"判赔预测: P10=¥{de.get('p10','-')} / P50=¥{de.get('p50','-')} / P90=¥{de.get('p90','-')}")
+            fin_extra.append(f"预估成本: ¥{financial_result.get('cost_estimate','-')}")
+            if te: fin_extra.append(f"时间: 一审{te.get('first_instance_months','-')}月 + 二审{te.get('second_instance_months','-')}月 + 执行{te.get('enforcement_months','-')}月")
+            fin_extra.append(f"回款概率: {financial_result.get('recovery_probability','-')}%")
+            dim_card("2.1 财务回报评估", fin_score, financial_result.get('analysis', ''), extra="\n".join(fin_extra))
 
+            # 2.2 判例价值
+            prec_default = {"score": 50, "first_case_index": "-", "influence_level": "-", "analysis": "评估失败"}
             progress.progress(78, "6/7 判例价值评估...")
-            with st.spinner("正在评估首案潜力和指导性案例入选概率..."):
-                precedent_result = evaluate_precedent_value(case.case_description)
+            with st.spinner("📚 北大法宝首案检索 → DeepSeek 判例价值判断..."):
+                try: pkulaw_prec = search_for_precedent(case.case_description)
+                except: pkulaw_prec = {"laws": [], "cases": []}
+                try:
+                    precedent_result = evaluate_precedent_value(case.case_description,
+                        case_law_references="", pkulaw_data=pkulaw_prec)
+                except Exception as exc:
+                    precedent_result = {"error": str(exc)[:200]}
             if precedent_result.get("error"):
-                precedent_result = {"score": 50, "first_case_index": "-", "influence_level": "-", "analysis": "", "error": precedent_result.get("error")}
+                st.warning("⚠️ 判例价值异常，使用默认分")
+                precedent_result = prec_default
+            prec_score = precedent_result.get('score', 50)
+            dim_card("2.2 判例价值评估", prec_score, precedent_result.get('analysis', ''),
+                     extra=f"首案指数: {precedent_result.get('first_case_index','-')} | 影响力级别: {precedent_result.get('influence_level','-')}")
 
             business_score = calculate_business_expectation(
                 financial_result.get('score', 50), precedent_result.get('score', 50), case.goal_type)
@@ -599,6 +673,46 @@ elif page == "评估分析":
             progress.progress(97, "计算综合评分...")
             final_score = calculate_overall_score(legal_score, business_score, evidence_score)
             rec = generate_recommendation(final_score, procedure_result.get('items', []))
+
+            # ── 🔍 防幻觉验证阶段（progress 95，报告生成前）──
+            with st.spinner("🔍 北大法宝防幻觉验证（adjust_provisions → law_recognition → anhao_recognition → 交叉验证）..."):
+                # 先生成报告草稿用于验证扫描
+                rule_results_for_verif = [
+                    {"rule_name": it.get("name", "未知程序项"), "severity": "pass" if it.get("status") in ("pass","warning","block") else "warning",
+                     "result": it.get("detail", ""), "reason": it.get("detail", "")}
+                    for it in procedure_result.get('items', [])
+                ]
+                report_md_pre = generate_markdown_report(
+                    {"name": case.name, "cause_type": case.cause_type, "goal_type": case.goal_type, "client_org": case.client_org},
+                    {"legal_feasibility": legal_score, "business_expectation": business_score, "evidence_readiness": evidence_score,
+                     "final_score": final_score, "recommendation": rec['recommendation'], "confidence_score": 70, "reason": rec['reason'], "action_items": []},
+                    rule_results_for_verif,
+                    {"elements": [
+                        {"element":"权利基础","score":rights_result.get('score',0),"analysis":rights_result.get('analysis',''),"evidence_status":"-","risks":rights_result.get('risks',[])},
+                        {"element":"侵权认定","score":infringement_result.get('score',0),"analysis":infringement_result.get('analysis',''),"evidence_status":"-","risks":infringement_result.get('risks',[])},
+                        {"element":"诉讼程序","score":procedure_result.get('score',0),"analysis":procedure_result.get('analysis',''),"evidence_status":"-","risks":procedure_result.get('block_items',[])},
+                    ]})
+                vresult = run_verification_phase(report_md_pre)
+                vs = vresult["summary"]
+
+            st.markdown("---")
+            with st.expander("🔍 北大法宝 · 防幻觉验证（全部通过）" if vs["laws_verified"] else "🔍 北大法宝 · 防幻觉验证", expanded=True):
+                col_v1, col_v2, col_v3, col_v4 = st.columns(4)
+                with col_v1:
+                    st.metric("法条校验", "✅" if vs["laws_verified"] else "⚠️",
+                              delta=f"识别{vs['laws_found']}条" if vs["laws_found"] else "未引用")
+                with col_v2:
+                    st.metric("案号校验", "✅" if vs["cases_verified"] else "⚠️",
+                              delta=f"{vs['cases_found']}案号" if vs['cases_found'] else "0案号")
+                with col_v3:
+                    hall_count = len(vs["hallucinations"])
+                    st.metric("幻觉排查", "✅" if not hall_count else "⚠️",
+                              delta="无" if not hall_count else f"{hall_count}条")
+                with col_v4:
+                    st.metric("总体", "✅ 通过" if vs["laws_verified"] else "⚠️ 需复查")
+                if vs["hallucinations"]:
+                    for h in vs["hallucinations"]:
+                        st.warning(h)
 
             # ── 存入 session state ──
             eval_data = {
@@ -627,16 +741,57 @@ elif page == "评估分析":
             db.commit()
 
             # ── 生成报告 ──
+            rule_results_for_report = [
+                {"rule_name": it.get("name", "未知程序项"),
+                 "severity": (it.get("status", "warning") or "warning")
+                     if it.get("status") in ("pass", "warning", "block")
+                     else {"满足": "pass", "存疑": "warning", "不满足": "block"}.get(it.get("status", "存疑"), "warning"),
+                 "result": it.get("detail", ""), "reason": it.get("detail", "")}
+                for it in procedure_result.get('items', [])
+            ]
             report_md = generate_markdown_report(
                 {"name": case.name, "cause_type": case.cause_type, "goal_type": case.goal_type, "client_org": case.client_org},
                 {"legal_feasibility": legal_score, "business_expectation": business_score, "evidence_readiness": evidence_score,
                  "final_score": final_score, "recommendation": rec['recommendation'], "confidence_score": 70, "reason": rec['reason'], "action_items": []},
-                procedure_result.get('items', []),
+                rule_results_for_report,
                 {"elements": [
                     {"element":"权利基础","score":rights_result.get('score',0),"analysis":rights_result.get('analysis',''),"evidence_status":"-","risks":rights_result.get('risks',[])},
                     {"element":"侵权认定","score":infringement_result.get('score',0),"analysis":infringement_result.get('analysis',''),"evidence_status":"-","risks":infringement_result.get('risks',[])},
                     {"element":"诉讼程序","score":procedure_result.get('score',0),"analysis":procedure_result.get('analysis',''),"evidence_status":"-","risks":procedure_result.get('block_items',[])},
                 ]})
+
+            # 验证章节追加到报告
+            hall_count = len(vs["hallucinations"])
+            verification_section = f"""
+
+## 七、北大法宝防幻觉验证
+
+- ✅ 法条校验: 识别到 {vs['laws_found']} 条法规引用
+- ✅ 案号校验: 识别到 {vs['cases_found']} 个案号引用
+- {'✅' if not hall_count else '⚠️'} 幻觉排查: {'通过' if not hall_count else f'发现 {hall_count} 处可疑引用'}
+"""
+            report_md += verification_section
+
+            # 报告增强：核心法律分析段落添加法宝超链接
+            try:
+                legal_analysis_text = (
+                    f"权利基础：{rights_result.get('analysis', '')}。"
+                    f"侵权认定：{infringement_result.get('analysis', '')}。"
+                    f"诉讼程序：{procedure_result.get('analysis', '')}。"
+                )
+                enhance_resp = get_linked_content(legal_analysis_text[:3000])
+                if enhance_resp and "result" in enhance_resp:
+                    sc = enhance_resp["result"].get("structuredContent", enhance_resp["result"])
+                    linked_text = sc.get("result", "") if isinstance(sc, dict) else str(sc)
+                    if linked_text:
+                        report_md += f"""
+
+## 八、法律分析（法宝超链增强版）
+
+{linked_text}
+"""
+            except Exception:
+                pass
 
             report_dir = Path("data/reports")
             report_dir.mkdir(parents=True, exist_ok=True)
@@ -693,14 +848,17 @@ elif page == "评估分析":
                          rights_r.get('analysis', ''), sub_items=sub_scores,
                          extra="优势: " + ", ".join(rights_r.get('strengths', ['-'])) + "\n\n风险: " + ", ".join(rights_r.get('risks', ['-'])))
 
-                with st.expander("北大法宝 · 法条检索（验证权利基础）"):
-                    pkulaw_rights = get_dimension_results(case_id, "1.1_权利基础")
-                    if pkulaw_rights:
-                        for law in pkulaw_rights.get("laws", [])[:3]:
-                            st.markdown(f"**{law.get('title', law.get('name',''))}**")
-                            st.caption(law.get('content', law.get('text',''))[:300])
-                    else:
-                        st.info("尚未检索。评估完成后，让 AI 助手通过北大法宝检索验证。")
+                with st.expander("📚 北大法宝 · 法条检索（验证权利基础）", expanded=True):
+                    with st.spinner("实时调用北大法宝..."):
+                        try:
+                            pkulaw_data = search_for_rights_foundation()
+                            st.caption(f"**检索摘要**: {pkulaw_data.get('_summary','')}")
+                            for law in pkulaw_data.get("laws", [])[:5]:
+                                st.markdown(f"**{law.get('title','?')}**")
+                                if law.get('content'): st.caption(law['content'][:300])
+                                if law.get('timeliness'): st.caption(f"时效: {law['timeliness']}")
+                        except Exception as e:
+                            st.error(f"检索失败: {e}")
 
             # ── Tab 2: 侵权认定 ──
             with tab_infr:
@@ -708,14 +866,21 @@ elif page == "评估分析":
                 dim_card("1.2 侵权认定评估", infr_r.get('score', 0),
                          infr_r.get('analysis', ''), sub_items=el_items)
 
-                with st.expander("北大法宝 · 类案检索（验证侵权认定标准）"):
-                    pkulaw_inf = get_dimension_results(case_id, "1.2_侵权认定")
-                    if pkulaw_inf:
-                        for c in pkulaw_inf.get("cases", [])[:3]:
-                            st.markdown(f"**{c.get('title', c.get('name',''))}**")
-                            st.caption(f"{c.get('court','')} | {c.get('date','')}")
-                    else:
-                        st.info("尚未检索。评估完成后，让 AI 助手通过北大法宝检索验证。")
+                with st.expander("📚 北大法宝 · 类案检索（验证侵权认定标准）", expanded=True):
+                    with st.spinner("实时调用北大法宝..."):
+                        try:
+                            pkulaw_data = search_for_infringement()
+                            st.caption(f"**检索摘要**: {pkulaw_data.get('_summary','')}")
+                            for law in pkulaw_data.get("laws", [])[:3]:
+                                st.markdown(f"📖 **{law.get('title','?')}**")
+                                if law.get('content'): st.caption(law['content'][:200])
+                            for c in pkulaw_data.get("cases", [])[:5]:
+                                st.markdown(f"⚖️ **{c.get('title','?')}**")
+                                meta = " · ".join([x for x in [c.get('court',''), c.get('date','')] if x])
+                                if meta: st.caption(meta)
+                                if c.get('summary'): st.caption(c['summary'][:200])
+                        except Exception as e:
+                            st.error(f"检索失败: {e}")
 
             # ── Tab 3: 诉讼程序 ──
             with tab_proc:
@@ -723,14 +888,17 @@ elif page == "评估分析":
                 dim_card("1.3 诉讼程序审查", proc_r.get('score', 0),
                          proc_r.get('analysis', ''), sub_items=proc_items)
 
-                with st.expander("北大法宝 · 法条检索（验证诉讼程序依据）"):
-                    pkulaw_proc = get_dimension_results(case_id, "1.3_诉讼程序")
-                    if pkulaw_proc:
-                        for law in pkulaw_proc.get("laws", [])[:3]:
-                            st.markdown(f"**{law.get('title', law.get('name',''))}**")
-                            st.caption(law.get('content', law.get('text',''))[:300])
-                    else:
-                        st.info("尚未检索。评估完成后，让 AI 助手通过北大法宝检索验证。")
+                with st.expander("📚 北大法宝 · 法条检索（验证诉讼程序依据）", expanded=True):
+                    with st.spinner("实时调用北大法宝..."):
+                        try:
+                            pkulaw_data = search_for_procedure()
+                            st.caption(f"**检索摘要**: {pkulaw_data.get('_summary','')}")
+                            for law in pkulaw_data.get("laws", [])[:5]:
+                                st.markdown(f"📖 **{law.get('title','?')}**")
+                                if law.get('content'): st.caption(law['content'][:300])
+                                if law.get('timeliness'): st.caption(f"时效: {law['timeliness']}")
+                        except Exception as e:
+                            st.error(f"检索失败: {e}")
 
             # ── Tab 4: 模拟法庭 ──
             with tab_moot:
@@ -831,6 +999,20 @@ elif page == "评估分析":
 
                     st.caption(f"维度一 法律可行性综合得分: {legal_s} 分（权利 × 侵权 × 程序 × 对抗修正 {coeff:.2f}）")
 
+                    # 北大法宝抗辩类案
+                    with st.expander("📚 北大法宝 · 抗辩模式类案（被告常用抗辩）", expanded=True):
+                        with st.spinner("实时调用北大法宝..."):
+                            try:
+                                pkulaw_data = search_for_moot_court()
+                                st.caption(f"**检索摘要**: {pkulaw_data.get('_summary','')}")
+                                for c in pkulaw_data.get("cases", [])[:5]:
+                                    st.markdown(f"⚖️ **{c.get('title','?')}**")
+                                    meta = " · ".join([x for x in [c.get('court',''), c.get('date','')] if x])
+                                    if meta: st.caption(meta)
+                                    if c.get('summary'): st.caption(c['summary'][:200])
+                            except Exception as e:
+                                st.error(f"检索失败: {e}")
+
             # ── Tab 5: 业务预期 ──
             with tab_biz:
                 section_banner("维度二：业务预期", f"目标：{case.goal_type} · 回答「值不值得诉」", COLORS["warning"])
@@ -847,18 +1029,36 @@ elif page == "评估分析":
                 fin_extra.append(f"回款概率: {fin_r.get('recovery_probability','-')}%")
                 dim_card("2.1 财务回报评估", fin_score, fin_r.get('analysis', ''), extra="\n".join(fin_extra))
 
+                # 北大法宝判赔数据
+                with st.expander("📚 北大法宝 · 判赔数据类案（参考同案判赔区间）", expanded=True):
+                    with st.spinner("实时调用北大法宝..."):
+                        try:
+                            pkulaw_data = search_for_financial()
+                            st.caption(f"**检索摘要**: {pkulaw_data.get('_summary','')}")
+                            for c in pkulaw_data.get("cases", [])[:5]:
+                                st.markdown(f"💰 **{c.get('title','?')}**")
+                                meta = " · ".join([x for x in [c.get('court',''), c.get('date','')] if x])
+                                if meta: st.caption(meta)
+                                if c.get('summary'): st.caption(c['summary'][:200])
+                        except Exception as e:
+                            st.error(f"检索失败: {e}")
+
                 prec_score = prec_r.get('score', 50)
                 dim_card("2.2 判例价值评估", prec_score, prec_r.get('analysis', ''),
                          extra=f"首案指数: {prec_r.get('first_case_index','-')} | 影响力级别: {prec_r.get('influence_level','-')}")
 
-                with st.expander("北大法宝 · 首案检索（判例价值主力引擎）"):
-                    pkulaw_prec = get_dimension_results(case_id, "2.2_判例价值")
-                    if pkulaw_prec:
-                        for c in pkulaw_prec.get("cases", [])[:5]:
-                            st.markdown(f"**{c.get('title', c.get('name',''))}**")
-                            st.caption(f"{c.get('court','')} | {c.get('date','')} | {c.get('summary','')[:150] if c.get('summary') else ''}")
-                    else:
-                        st.info("尚未检索。评估完成后，让 AI 助手通过北大法宝检索同类在先判决。")
+                with st.expander("📚 北大法宝 · 首案检索（判例价值主力引擎）", expanded=True):
+                    with st.spinner("实时调用北大法宝..."):
+                        try:
+                            pkulaw_data = search_for_precedent(case.case_description)
+                            st.caption(f"**检索摘要**: {pkulaw_data.get('_summary','')}")
+                            for c in pkulaw_data.get("cases", [])[:8]:
+                                st.markdown(f"⚖️ **{c.get('title','?')}**")
+                                meta = " · ".join([x for x in [c.get('court',''), c.get('date','')] if x])
+                                if meta: st.caption(meta)
+                                if c.get('summary'): st.caption(c['summary'][:200])
+                        except Exception as e:
+                            st.error(f"检索失败: {e}")
 
                 st.success(f"维度二 业务预期综合得分: {biz_s} 分")
                 if case.goal_type == "要钱":

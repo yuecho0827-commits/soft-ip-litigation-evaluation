@@ -4,6 +4,7 @@
 # 数据库
 data/soft_ip.db
 data/reports/
+data/pkulaw_queries_*.json
 
 # Python
 __pycache__/

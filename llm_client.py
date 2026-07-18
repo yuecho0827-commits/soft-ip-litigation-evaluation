@@ -55,10 +55,62 @@ def _call_llm(system_prompt: str, user_prompt: str, temperature: float = 0.2) ->
 
 
 # ============================================================
+# PKULaw 上下文格式化
+# ============================================================
+
+def _has_pkulaw(d) -> bool:
+    """判断 pkulaw_data 是否有有效数据"""
+    if not d or not isinstance(d, dict):
+        return False
+    return bool(d.get("laws")) or bool(d.get("cases"))
+
+
+def _fmt_laws(pkulaw_data: dict) -> str:
+    """格式化法条上下文"""
+    if not _has_pkulaw(pkulaw_data):
+        return ""
+    items = pkulaw_data.get("laws", [])[:5]
+    if not items:
+        return ""
+    parts = ["\n## 北大法宝检索到的法条（主要分析依据）\n"]
+    for i, it in enumerate(items, 1):
+        title = it.get("title", "")
+        content = it.get("content", "")
+        time = it.get("timeliness", "")
+        parts.append(f"{i}. {title}（{time}）" if time else f"{i}. {title}")
+        if content:
+            parts.append(f"   {content[:300]}")
+    return "\n".join(parts)
+
+
+def _fmt_cases(pkulaw_data: dict) -> str:
+    """格式化类案上下文"""
+    if not _has_pkulaw(pkulaw_data):
+        return ""
+    items = pkulaw_data.get("cases", [])[:5]
+    if not items:
+        return ""
+    parts = ["\n## 北大法宝检索到的类案（参考判例）\n"]
+    for i, it in enumerate(items, 1):
+        title = it.get("title", "")
+        court = it.get("court", "")
+        date = it.get("date", "")
+        summary = it.get("summary", "")
+        line = f"{i}. {title}"
+        meta = " · ".join([x for x in [court, date] if x])
+        if meta:
+            line += f"（{meta}）"
+        parts.append(line)
+        if summary:
+            parts.append(f"   {summary[:200]}")
+    return "\n".join(parts)
+
+
+# ============================================================
 # 维度一：法律可行性
 # ============================================================
 
-def evaluate_rights_foundation(case_description: str, party_info: str = "", uploaded_texts: str = "") -> Dict:
+def evaluate_rights_foundation(case_description: str, party_info: str = "", uploaded_texts: str = "", pkulaw_data: dict = None) -> Dict:
     """
     子维度 1.1：权利基础评估
     评估商标权的有效性、使用情况、撤三风险、跨类保护可能性
@@ -73,6 +125,7 @@ def evaluate_rights_foundation(case_description: str, party_info: str = "", uplo
 
 ## 证据材料文本
 {uploaded_texts[:2000] if uploaded_texts else "未提供"}
+{_fmt_laws(pkulaw_data)}
 
 ## 评估框架
 请从以下维度评估商标权利基础：
@@ -106,7 +159,7 @@ def evaluate_rights_foundation(case_description: str, party_info: str = "", uplo
     )
 
 
-def evaluate_infringement(case_description: str, rights_assessment: str = "", uploaded_texts: str = "") -> Dict:
+def evaluate_infringement(case_description: str, rights_assessment: str = "", uploaded_texts: str = "", pkulaw_data: dict = None) -> Dict:
     """
     子维度 1.2：侵权认定评估（单方视角）
     分析商标侵权构成要件：商标性使用、商品类似性、商标近似性、混淆可能性、正当使用
@@ -121,6 +174,8 @@ def evaluate_infringement(case_description: str, rights_assessment: str = "", up
 
 ## 证据材料
 {uploaded_texts[:2000] if uploaded_texts else "未提供"}
+{_fmt_laws(pkulaw_data)}
+{_fmt_cases(pkulaw_data)}
 
 ## 评估框架（商标侵权五要件）
 逐一分析以下要件是否满足：
@@ -156,7 +211,7 @@ def evaluate_infringement(case_description: str, rights_assessment: str = "", up
     )
 
 
-def evaluate_procedure(case_description: str, party_info: str = "") -> Dict:
+def evaluate_procedure(case_description: str, party_info: str = "", pkulaw_data: dict = None) -> Dict:
     """
     子维度 1.3：诉讼程序审查
     时效、管辖、主体适格、前置程序
@@ -168,6 +223,7 @@ def evaluate_procedure(case_description: str, party_info: str = "") -> Dict:
 
 ## 当事人信息
 {party_info[:1000] if party_info else "未提供"}
+{_fmt_laws(pkulaw_data)}
 
 ## 评估框架
 1. 诉讼时效（3年，自知道权利受损+义务人之日起算）
@@ -204,7 +260,8 @@ def run_moot_court_simulation(
     case_description: str,
     rights_assessment: str,
     infringement_assessment: str,
-    evidence_summary: str
+    evidence_summary: str,
+    pkulaw_data: dict = None
 ) -> Dict:
     """
     子维度 1.4：模拟法庭（对抗检验）
@@ -220,6 +277,7 @@ def run_moot_court_simulation(
 
 ## 侵权认定评估（原告视角）
 {infringement_assessment[:1000]}
+{_fmt_cases(pkulaw_data)}
 
 ## 证据概要
 {evidence_summary[:1000] if evidence_summary else "未提供"}
@@ -260,7 +318,8 @@ def run_moot_court_simulation(
 def evaluate_financial_return(
     case_description: str,
     infringement_severity: str = "",
-    case_law_references: str = ""
+    case_law_references: str = "",
+    pkulaw_data: dict = None
 ) -> Dict:
     """
     子维度 2.1：财务回报评估
@@ -276,6 +335,7 @@ def evaluate_financial_return(
 
 ## 类案参考
 {case_law_references[:2000] if case_law_references else "暂无（建议使用北大法宝检索同类案件"}
+{_fmt_cases(pkulaw_data)}
 
 ## 评估框架
 1. 预期判赔/和解金额（结合法定赔偿区间、类案数据、惩罚性赔偿概率）
@@ -314,7 +374,8 @@ def evaluate_financial_return(
 
 def evaluate_precedent_value(
     case_description: str,
-    case_law_references: str = ""
+    case_law_references: str = "",
+    pkulaw_data: dict = None
 ) -> Dict:
     """
     子维度 2.2：判例价值评估
@@ -327,6 +388,7 @@ def evaluate_precedent_value(
 
 ## 类案参考
 {case_law_references[:2000] if case_law_references else "暂无（建议使用北大法宝检索确认是否存在同类在先判决"}
+{_fmt_cases(pkulaw_data)}
 
 ## 评估框架
 1. 首案潜力（涉及的法律问题是否有在先判例）
