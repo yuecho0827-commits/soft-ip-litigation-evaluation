@@ -14,7 +14,7 @@ from datetime import datetime
 sys.path.append(str(Path(__file__).parent))
 
 from config import APP_TITLE, APP_VERSION, USE_MOCK
-from database import init_db, SessionLocal, Case, RuleHit, ScoreSnapshot, Report
+from database import init_db, SessionLocal, Case, Party, RuleHit, ScoreSnapshot, Report
 from evidence_parser import parse_pdf, ocr_image, is_pdf_file, is_image_file
 from report_generator import generate_markdown_report, generate_pdf_bytes
 from pkulaw_api import (
@@ -22,6 +22,7 @@ from pkulaw_api import (
     search_for_moot_court, search_for_financial, search_for_precedent,
     run_verification_phase, get_linked_content
 )
+from qcc_api import search_for_financial_qcc_full
 from styles import (
     inject_global_css, page_header, section_banner, dim_card,
     score_bar, final_score_card, case_card, chat_bubble,
@@ -616,13 +617,28 @@ elif page == "评估分析":
             # 2.1 财务回报
             fin_default = {"score": 50, "damages_estimate": {}, "cost_estimate": "-", "time_estimate": {}, "recovery_probability": "-", "analysis": "评估失败"}
             progress.progress(64, "5/7 财务回报评估...")
+
+            # 获取被告名称并调用企查查
+            defendant_name = ""
+            defendant_party = db.query(Party).filter(Party.case_id == case_id, Party.role == "defendant").first()
+            if defendant_party:
+                defendant_name = defendant_party.name
+
+            qcc_data = None
+            if defendant_name:
+                with st.spinner("🏢 企查查调取被告财务画像（主体锁定→风险分诊→偿付能力→经营规模）..."):
+                    try:
+                        qcc_data = search_for_financial_qcc_full(defendant_name)
+                    except Exception:
+                        qcc_data = {"_summary": "企查查调用失败", "stages": {}, "metrics": {}}
+
             with st.spinner("📚 北大法宝检索判赔数据 → DeepSeek 预测..."):
                 try: pkulaw_fin = search_for_financial()
                 except: pkulaw_fin = {"laws": [], "cases": []}
                 try:
                     financial_result = evaluate_financial_return(case.case_description,
                         infringement_severity=str(infringement_result.get('analysis', '')),
-                        case_law_references="", pkulaw_data=pkulaw_fin)
+                        case_law_references="", pkulaw_data=pkulaw_fin, qcc_data=qcc_data)
                 except Exception as exc:
                     financial_result = {"error": str(exc)[:200]}
             if financial_result.get("error"):
@@ -723,6 +739,7 @@ elif page == "评估分析":
                 "financial": financial_result,
                 "precedent": precedent_result,
                 "evidence": evidence_result,
+                "qcc_data": qcc_data or {},
                 "legal_score": legal_score,
                 "business_score": business_score,
                 "evidence_score": evidence_score,
@@ -1028,6 +1045,50 @@ elif page == "评估分析":
                     fin_extra.append(f"时间: 一审{te.get('first_instance_months','-')}月 + 二审{te.get('second_instance_months','-')}月 + 执行{te.get('enforcement_months','-')}月")
                 fin_extra.append(f"回款概率: {fin_r.get('recovery_probability','-')}%")
                 dim_card("2.1 财务回报评估", fin_score, fin_r.get('analysis', ''), extra="\n".join(fin_extra))
+
+                # ── 企查查 · 被告财务画像 ──
+                qcc_d = eval_data.get("qcc_data", {})
+                if qcc_d and qcc_d.get("stages"):
+                    with st.expander("🏢 企查查 · 被告财务画像（实测数据）", expanded=False):
+                        st.caption(qcc_d.get("_summary", ""))
+                        metrics = qcc_d.get("metrics", {})
+                        if metrics:
+                            cols = st.columns(3)
+                            cols[0].metric("回款概率", f"{metrics.get('recovery_probability', '-')}%")
+                            cols[1].metric("判赔方向", metrics.get('damages_adjustment', '-'))
+                            cols[2].metric("时间延长", f"+{metrics.get('time_extra_months', 0)}月")
+                            reds = metrics.get("red_flags", [])
+                            greens = metrics.get("green_flags", [])
+                            if reds:
+                                st.error("🚨 " + " | ".join(reds[:5]))
+                            if greens:
+                                st.success("✅ " + " | ".join(greens[:5]))
+
+                        # 阶段 D 风险明细
+                        d_stage = qcc_d.get("stages", {}).get("D_风险下钻", {})
+                        if d_stage:
+                            risk_lines = []
+                            for label in ("失信信息", "被执行人", "终本案件", "限高消费", "经营异常", "严重违法",
+                                          "股权冻结", "动产抵押", "土地抵押", "司法拍卖", "欠税公告", "税收违法"):
+                                row = d_stage.get(label, {})
+                                if isinstance(row, dict) and row.get("_summary"):
+                                    risk_lines.append(f"- {label}: {row['_summary']}")
+                            if risk_lines:
+                                st.caption("**风险明细**")
+                                st.text("\n".join(risk_lines))
+
+                        # 阶段 F 经营规模
+                        f_stage = qcc_d.get("stages", {}).get("F_经营规模", {})
+                        if f_stage:
+                            ch_lines = []
+                            for label in ("商标资产", "线上店铺", "APP信息", "小程序", "微信公众号", "抖音账号",
+                                          "招投标", "融资记录", "荣誉信息", "榜单排名", "招聘信息"):
+                                row = f_stage.get(label, {})
+                                if isinstance(row, dict):
+                                    ch_lines.append(f"- {label}: {row.get('_summary', '')}")
+                            if ch_lines:
+                                st.caption("**经营规模与侵权渠道**")
+                                st.text("\n".join(ch_lines))
 
                 # 北大法宝判赔数据
                 with st.expander("📚 北大法宝 · 判赔数据类案（参考同案判赔区间）", expanded=True):

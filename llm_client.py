@@ -312,6 +312,66 @@ def run_moot_court_simulation(
 
 
 # ============================================================
+# QCC 数据格式化
+# ============================================================
+
+def _has_qcc(d) -> bool:
+    """判断 qcc_data 是否有有效数据"""
+    if not d or not isinstance(d, dict):
+        return False
+    return bool(d.get("_summary")) or bool(d.get("metrics"))
+
+
+def _fmt_qcc(qcc_data: dict) -> str:
+    """格式化企查查关键发现为 prompt 文本"""
+    if not _has_qcc(qcc_data):
+        return ""
+    parts = ["\n## 企查查 · 被告财务画像（实测数据，作为判赔预测依据）\n"]
+
+    # 摘要
+    summary = qcc_data.get("_summary", "")
+    if summary:
+        parts.append(f"**检索摘要**: {summary}")
+
+    # 指标
+    metrics = qcc_data.get("metrics", {})
+    if metrics:
+        prob = metrics.get("recovery_probability", "-")
+        parts.append(f"- 回款概率(企查查测算): {prob}%")
+        da = metrics.get("damages_adjustment", "")
+        if da:
+            parts.append(f"- 判赔调整方向: {da}")
+        extra = metrics.get("time_extra_months", 0)
+        parts.append(f"- 时间延长量: +{extra}月")
+
+        reds = metrics.get("red_flags", [])
+        if reds:
+            parts.append(f"- 🚨 风险信号: {'; '.join(reds[:5])}")
+        greens = metrics.get("green_flags", [])
+        if greens:
+            parts.append(f"- ✅ 利好信号: {'; '.join(greens[:5])}")
+
+    # 阶段D关键数据（失信/被执行/终本）
+    stages = qcc_data.get("stages", {})
+    d_stage = stages.get("D_风险下钻", {})
+    if d_stage:
+        parts.append("\n### 被告风险明细（企查查实测）")
+        for label in ("失信信息", "被执行人", "终本案件", "限高消费", "经营异常", "严重违法"):
+            row = d_stage.get(label, {})
+            if isinstance(row, dict) and row.get("_summary"):
+                parts.append(f"- {label}: {row['_summary']}")
+
+    # 阶段F经营规模
+    f_stage = stages.get("F_经营规模", {})
+    if f_stage:
+        fsum = f_stage.get("_summary", "")
+        if fsum:
+            parts.append(f"\n### 被告经营规模\n{fsum}")
+
+    return "\n".join(parts)
+
+
+# ============================================================
 # 维度二：业务预期
 # ============================================================
 
@@ -319,11 +379,13 @@ def evaluate_financial_return(
     case_description: str,
     infringement_severity: str = "",
     case_law_references: str = "",
-    pkulaw_data: dict = None
+    pkulaw_data: dict = None,
+    qcc_data: dict = None
 ) -> Dict:
     """
     子维度 2.1：财务回报评估
     判赔预测 + 成本估算 + 时间成本 + 执行回款概率
+    企查查数据为判赔预测和回款概率提供实测先验参数
     """
     prompt = f"""你是知识产权诉讼财务分析师。请评估商标侵权案件的财务可行性。
 
@@ -336,13 +398,15 @@ def evaluate_financial_return(
 ## 类案参考
 {case_law_references[:2000] if case_law_references else "暂无（建议使用北大法宝检索同类案件"}
 {_fmt_cases(pkulaw_data)}
+{_fmt_qcc(qcc_data)}
 
 ## 评估框架
-1. 预期判赔/和解金额（结合法定赔偿区间、类案数据、惩罚性赔偿概率）
+请基于以上信息（特别是企查查实测数据），分析以下5项：
+1. 预期判赔/和解金额（结合法定赔偿区间、类案数据、企查查提供的被告经营规模和风险画像，惩罚性赔偿概率）
 2. 诉讼成本估算（律师费、诉讼费、公证费等）
-3. 时间成本（一审+二审+执行周期）
-4. 执行回款概率（被告偿付能力）
-5. 净收益预测
+3. 时间成本（一审+二审+执行周期，结合企查查提供的被告拖延倾向和执行风险）
+4. 执行回款概率（结合企查查实测被告偿付能力数据：失信/被执行/终本/限高等风险信号）
+5. 净收益预测 NPV = P50 × 回款概率 - 总成本 - 时间折现
 
 ## 返回格式（严格 JSON）
 {{
@@ -359,15 +423,15 @@ def evaluate_financial_return(
     "second_instance_months": 二审月数,
     "enforcement_months": 执行月数
   }},
-  "recovery_probability": 0-100 (回款概率百分比),
+  "recovery_probability": 0-100 (回款概率百分比, 参考但不照搬企查查数据),
   "net_present_value": "净收益估算",
-  "analysis": "财务分析总结"
+  "analysis": "财务分析总结（200字以内，必须引用企查查的风险/利好信号）"
 }}
 
 只返回 JSON。"""
 
     return _call_llm(
-        "你是知识产权诉讼财务分析师。请严格按 JSON 格式返回。",
+        "你是知识产权诉讼财务分析师。请严格按 JSON 格式返回，必须参考企查查实测数据。",
         prompt, 0.2
     )
 

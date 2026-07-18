@@ -174,7 +174,9 @@ def evaluate_procedure(
 def evaluate_financial_return(
     case_description: str,
     infringement_severity: str = "",
-    case_law_references: str = ""
+    case_law_references: str = "",
+    pkulaw_data: dict = None,
+    qcc_data: dict = None
 ) -> Dict[str, Any]:
     """
     子维度 2.1：财务回报评估
