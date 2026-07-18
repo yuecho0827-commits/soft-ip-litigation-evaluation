@@ -532,6 +532,62 @@ def evaluate_evidence_readiness(
 
 
 # ============================================================
+# Phase 1: 被告身份提取（LLM NER + 消歧）
+# ============================================================
+
+def extract_defendant_info(case_description: str) -> dict:
+    """
+    从案情描述中提取被告结构化身份信息。
+    返回: {defendants:[{name,type,aliases,location_hint,industry_hint,scale_hint,...}], ...}
+    """
+    prompt = f"""你是一个法律信息提取引擎。你的任务是从 Soft IP 案件的案情描述中，精确提取被告的身份信息。
+
+## 提取规则
+
+1. **名称提取**：优先提取法定全称（如"北京字节跳动网络技术有限公司"），同时记录简称。只有简称时在 name 填简称，uncertainties 标注"仅获取简称，需外部消歧"。自然人提取姓名。
+
+2. **类型判断**：
+   - 含"公司/有限公司/股份有限公司" → enterprise
+   - 含"厂/店/工作室/经营部" + 自然人姓名 → self_employed
+   - 纯自然人姓名（无公司后缀）→ individual
+   - 含"协会/基金会/事业单位" → other_org
+
+3. **隐性信息**：从侵权规模描述提取 scale_hint，从侵权行为地提取 location_hint，从侵权商品类型推断 industry_hint，原文中的财务数据填入 known_financial_context。
+
+4. **多被告**：逐一提取，标注 role（primary_defendant / co_defendant）。
+
+## 内容
+{case_description[:4000]}
+
+## 返回格式（严格 JSON，不含其他内容）
+{{
+  "defendants": [
+    {{
+      "name": "法定全称或最佳近似",
+      "aliases": ["简称1"],
+      "type": "enterprise|individual|self_employed|other_org",
+      "role": "primary_defendant|co_defendant",
+      "location_hint": "",
+      "industry_hint": "",
+      "scale_hint": "",
+      "known_financial_context": "",
+      "extracted_from": "原文字句",
+      "confidence": 0.0-1.0
+    }}
+  ],
+  "uncertainties": [],
+  "total_defendants": 0
+}}
+
+只返回 JSON。"""
+
+    return _call_llm(
+        "你是一个法律信息提取引擎，专门从 Soft IP 案文中提取被告身份。严格按 JSON 返回，不要猜测，信息不足时标注 confidence 下降。",
+        prompt, 0.1
+    )
+
+
+# ============================================================
 # 健康检查
 # ============================================================
 

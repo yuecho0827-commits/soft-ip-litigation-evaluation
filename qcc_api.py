@@ -208,15 +208,33 @@ def _safe_call(tool_name: str, search_key: str, server: str = None, extra_args: 
 # 8 阶段工作流
 # ============================================================
 
-def search_for_financial_qcc_full(defendant_name: str) -> Dict:
+def search_for_financial_qcc_full(defendant_info: dict = None) -> Dict:
     """
     企查查 2.1 财务回报全流程评估
-    返回: {_summary, stages:{A,B,C,D,E,F,G}, metrics:{...}}
+    参数: defendant_info 为 Phase 1 LLM 提取的结构化被告信息
+      至少包含 name, type 字段；可选 aliases, location_hint, industry_hint
+    返回: {_summary, stages:{...}, metrics:{...}}
     """
-    if not defendant_name or not defendant_name.strip():
+    # 兼容旧版字符串调用
+    if isinstance(defendant_info, str):
+        defendant_info = {"name": defendant_info, "type": "enterprise"}
+
+    if not defendant_info or not defendant_info.get("name", "").strip():
         return {"_summary": "⚠️ 未提供被告名称，无法调用企查查", "stages": {}, "metrics": {}}
 
-    name = defendant_name.strip()
+    d_type = defendant_info.get("type", "enterprise")
+
+    if d_type == "individual":
+        return _search_individual(defendant_info)
+    else:
+        return _search_enterprise(defendant_info)
+
+
+def _search_enterprise(d: dict) -> Dict:
+    name = d.get("name", "").strip()
+    location_hint = d.get("location_hint", "")
+    industry_hint = d.get("industry_hint", "")
+
     result = {
         "_summary": "",
         "stages": {},
@@ -230,8 +248,8 @@ def search_for_financial_qcc_full(defendant_name: str) -> Dict:
     }
     summary_parts = []
 
-    # ── A: 主体锁定 ──
-    stage_a = _stage_a_lock_entity(name)
+    # ── A: 主体锁定（含消歧）──
+    stage_a = _stage_a_lock_entity(name, location_hint, industry_hint)
     result["stages"]["A_主体锁定"] = stage_a
     if stage_a.get("error"):
         result["_summary"] = f"❌ 阶段A失败: {stage_a['error']}"
@@ -299,9 +317,9 @@ def search_for_financial_qcc_full(defendant_name: str) -> Dict:
 
 
 # ── 阶段 A ──
-def _stage_a_lock_entity(name: str) -> dict:
-    """模糊搜索 → 锁定唯一主体"""
-    result = {"ok": False, "locked_name": "", "credit_code": "", "candidates": []}
+def _stage_a_lock_entity(name: str, location_hint: str = "", industry_hint: str = "") -> dict:
+    """模糊搜索 → 锁定唯一主体 → 用 location/industry 消歧"""
+    result = {"ok": False, "locked_name": "", "credit_code": "", "candidates": [], "match_status": ""}
 
     r = _safe_call("get_company_by_query", name, server="company")
     if r.get("error"):
@@ -341,19 +359,35 @@ def _stage_a_lock_entity(name: str) -> dict:
             candidates.append({"name": cname, "credit_code": ccode})
     result["candidates"] = candidates
 
-    # 锁定：唯一匹配 → 直接用；多候选 → 优先匹配名称包含原始搜索词
+    # 消歧锁定：多候选时用 industry_hint / location_hint 过滤
     if len(candidates) == 1:
         first = candidates[0]
     else:
-        first = candidates[0]
+        # 优先匹配行业线索
+        best = None
         for c in candidates:
-            if name in c.get("name", ""):
-                first = c
+            cname = c.get("name", "")
+            if industry_hint and industry_hint in cname:
+                best = c
                 break
+        # 优先匹配所在地
+        if not best and location_hint:
+            for c in candidates:
+                if location_hint in c.get("name", ""):
+                    best = c
+                    break
+        # 匹配搜索词
+        if not best:
+            for c in candidates:
+                if name in c.get("name", ""):
+                    best = c
+                    break
+        first = best or candidates[0]
 
     result["ok"] = True
     result["locked_name"] = first.get("name", name)
     result["credit_code"] = first.get("credit_code", "")
+    result["match_status"] = match_status
     result["match_status"] = match_status
     return result
 
@@ -737,6 +771,97 @@ def _stage_h_calc_metrics(
     metrics["time_extra_months"] = extra_months
 
     return metrics
+
+
+# ============================================================
+# 自然人被告查询
+# ============================================================
+
+def _search_individual(d: dict) -> Dict:
+    """自然人被告：执行→失信→限高→控制企业→股权冻结→历史投资"""
+    pname = d.get("name", "").strip()
+    result = {
+        "_summary": "",
+        "stages": {},
+        "metrics": {
+            "recovery_probability": 50.0,
+            "damages_p50": None,
+            "time_extra_months": 0,
+            "red_flags": [],
+            "green_flags": [],
+        }
+    }
+    summary_parts = [f"👤 被告类型: 自然人 ({pname})"]
+
+    # 风险扫描
+    scan_r = _safe_call("get_executive_risk_scan", pname, server="executive",
+                        extra_args={"personName": pname})
+    result["stages"]["E_人员风险扫描"] = {"_count": _count_items(scan_r)}
+
+    # 失信 / 被执行 / 限高
+    dishonest = _safe_call("get_executive_dishonest", pname, server="executive",
+                           extra_args={"personName": pname})
+    if _count_items(dishonest) > 0:
+        result["metrics"]["red_flags"].append(f"失信被执行人")
+        result["metrics"]["recovery_probability"] *= 0.1
+
+    debtor = _safe_call("get_executive_judgment_debtor", pname, server="executive",
+                        extra_args={"personName": pname})
+    jd_count = _count_items(debtor)
+    if jd_count >= 3:
+        result["metrics"]["red_flags"].append(f"被执行人≥{jd_count}次")
+        result["metrics"]["recovery_probability"] *= 0.3
+
+    high_consume = _safe_call("get_executive_high_consumption_ban", pname, server="executive",
+                               extra_args={"personName": pname})
+    if _count_items(high_consume) > 0:
+        result["metrics"]["red_flags"].append("限高消费")
+
+    result["stages"]["E_失信被执行限高"] = {
+        "失信": _count_items(dishonest),
+        "被执行": jd_count,
+        "限高": _count_items(high_consume),
+    }
+
+    # 控制企业 → 推断资产
+    controlled = _safe_call("get_executive_controlled_companies", pname, server="executive",
+                            extra_args={"personName": pname})
+    cc_count = _count_items(controlled)
+    if cc_count > 0:
+        result["metrics"]["green_flags"].append(f"控制{cc_count}家企业")
+        result["metrics"]["recovery_probability"] *= 1.2
+
+    # 股权冻结/质押
+    eq_freeze = _safe_call("get_executive_equity_freeze", pname, server="executive",
+                           extra_args={"personName": pname})
+    if _count_items(eq_freeze) > 0:
+        result["metrics"]["red_flags"].append("股权冻结")
+
+    eq_pledge = _safe_call("get_executive_equity_pledge", pname, server="executive",
+                           extra_args={"personName": pname})
+    if _count_items(eq_pledge) > 0:
+        result["metrics"]["red_flags"].append("股权质押")
+
+    result["stages"]["E_资产状况"] = {
+        "控制企业": cc_count,
+        "股权冻结": _count_items(eq_freeze),
+        "股权质押": _count_items(eq_pledge),
+    }
+
+    # 最终计算
+    result["metrics"]["recovery_probability"] = round(
+        max(min(result["metrics"]["recovery_probability"], 100), 0), 1
+    )
+    result["metrics"]["time_extra_months"] = jd_count * 2
+    result["metrics"]["damages_adjustment"] = "自然人 → 上限下调" if cc_count == 0 else "有控制企业 → 基准"
+
+    summary_parts.append(f"💰 回款概率: {result['metrics']['recovery_probability']:.0f}%")
+    if result["metrics"]["red_flags"]:
+        summary_parts.append(f"🚨 风险: {'; '.join(result['metrics']['red_flags'][:5])}")
+    if result["metrics"]["green_flags"]:
+        summary_parts.append(f"✅ 利好: {'; '.join(result['metrics']['green_flags'][:5])}")
+    result["_summary"] = "\n".join(summary_parts)
+    return result
 
 
 # ============================================================

@@ -7,6 +7,7 @@ import streamlit as st
 import sys
 import os
 import math
+import re
 import base64
 from pathlib import Path
 from datetime import datetime
@@ -49,6 +50,7 @@ else:
         evaluate_financial_return,
         evaluate_precedent_value,
         evaluate_evidence_readiness,
+        extract_defendant_info,
     )
     from moot_court import run_moot_court as run_moot_court_simulation
     _mock = False
@@ -618,19 +620,35 @@ elif page == "评估分析":
             fin_default = {"score": 50, "damages_estimate": {}, "cost_estimate": "-", "time_estimate": {}, "recovery_probability": "-", "analysis": "评估失败"}
             progress.progress(64, "5/7 财务回报评估...")
 
-            # 获取被告名称并调用企查查
-            defendant_name = ""
-            defendant_party = db.query(Party).filter(Party.case_id == case_id, Party.role == "defendant").first()
-            if defendant_party:
-                defendant_name = defendant_party.name
-
-            qcc_data = None
-            if defendant_name:
-                with st.spinner("🏢 企查查调取被告财务画像（主体锁定→风险分诊→偿付能力→经营规模）..."):
+            # Phase 1: LLM 提取被告身份
+            defend_info = None
+            if case.case_description:
+                with st.spinner("🔍 识别被告身份（LLM NER + 类型判断）..."):
                     try:
-                        qcc_data = search_for_financial_qcc_full(defendant_name)
+                        phase1 = extract_defendant_info(case.case_description)
+                        defendants = phase1.get("defendants", [])
+                        if defendants:
+                            for d in defendants:
+                                if isinstance(d, dict) and d.get("role") == "primary_defendant":
+                                    defend_info = d
+                                    break
+                            if not defend_info:
+                                defend_info = defendants[0]
+                    except Exception:
+                        defend_info = None
+
+            # Phase 2: 企查查查询
+            qcc_data = None
+            if defend_info:
+                dname = defend_info.get("name", "")
+                dtype = defend_info.get("type", "enterprise")
+                with st.spinner(f"🏢 企查查调取被告财务画像（{dname}，{'企业' if dtype != 'individual' else '自然人'}）..."):
+                    try:
+                        qcc_data = search_for_financial_qcc_full(defend_info)
                     except Exception:
                         qcc_data = {"_summary": "企查查调用失败", "stages": {}, "metrics": {}}
+            else:
+                qcc_data = {"_summary": "⚠️ 未识别到被告主体名称，无法调用企查查", "stages": {}, "metrics": {}}
 
             with st.spinner("📚 北大法宝检索判赔数据 → DeepSeek 预测..."):
                 try: pkulaw_fin = search_for_financial()
@@ -653,6 +671,36 @@ elif page == "评估分析":
             if te: fin_extra.append(f"时间: 一审{te.get('first_instance_months','-')}月 + 二审{te.get('second_instance_months','-')}月 + 执行{te.get('enforcement_months','-')}月")
             fin_extra.append(f"回款概率: {financial_result.get('recovery_probability','-')}%")
             dim_card("2.1 财务回报评估", fin_score, financial_result.get('analysis', ''), extra="\n".join(fin_extra))
+
+            # ── 企查查 · 被告财务画像（评估流程中展示）──
+            if qcc_data and qcc_data.get("stages"):
+                with st.expander("🏢 企查查 · 被告财务画像（实测数据）", expanded=False):
+                    st.caption(qcc_data.get("_summary", ""))
+                    metrics = qcc_data.get("metrics", {})
+                    if metrics:
+                        c1, c2, c3 = st.columns(3)
+                        c1.metric("回款概率", f"{metrics.get('recovery_probability', '-')}%")
+                        c2.metric("判赔方向", metrics.get('damages_adjustment', '-'))
+                        c3.metric("时间延长", f"+{metrics.get('time_extra_months', 0)}月")
+                        reds = metrics.get("red_flags", [])
+                        greens = metrics.get("green_flags", [])
+                        if reds: st.error("🚨 " + " | ".join(reds[:3]))
+                        if greens: st.success("✅ " + " | ".join(greens[:3]))
+                    # 风险明细
+                    d_stage = qcc_data.get("stages", {}).get("D_风险下钻", {})
+                    if d_stage:
+                        lines = []
+                        for k in ("失信信息","被执行人","终本案件","限高消费","经营异常","严重违法"):
+                            v = d_stage.get(k, {})
+                            if isinstance(v, dict) and v.get("_summary"):
+                                lines.append(f"- {k}: {v['_summary']}")
+                        if lines:
+                            st.caption("**风险明细**"); st.text("\n".join(lines))
+                    f_stage = qcc_data.get("stages", {}).get("F_经营规模", {})
+                    if f_stage:
+                        st.caption(f"**经营规模**: {f_stage.get('_summary','')}")
+            elif qcc_data and qcc_data.get("_summary"):
+                st.caption(f"🏢 {qcc_data['_summary']}")
 
             # 2.2 判例价值
             prec_default = {"score": 50, "first_case_index": "-", "influence_level": "-", "analysis": "评估失败"}
