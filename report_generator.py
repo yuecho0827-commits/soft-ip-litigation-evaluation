@@ -106,8 +106,8 @@ def generate_markdown_report(case_info: Dict, score_result: Dict, rule_results: 
 **关键缺失证据**:
 """
     for rule in rule_results:
-        if rule["severity"] in ["warning", "block"] and "缺失" in rule["rule_name"]:
-            md += f"- {rule['reason']}\n"
+        if rule.get("severity") in ["warning", "block"] and "缺失" in rule.get("rule_name", ""):
+            md += f"- {rule.get('reason', '')}\n"
 
     md += "\n---\n\n"
 

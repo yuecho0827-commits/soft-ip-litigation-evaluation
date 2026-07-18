@@ -469,7 +469,7 @@ elif page == "评估分析":
         status_colors = {"draft": COLORS["text_muted"], "evaluating": COLORS["warning"], "completed": COLORS["accent"]}
         st_color = status_colors.get(case.status, COLORS["text_muted"])
 
-        st.markdown(f"""
+        st.html(f"""
         <div class="card" style="border-left:4px solid {COLORS['primary']};">
             <div style="display:flex;justify-content:space-between;align-items:center;">
                 <div>
@@ -484,10 +484,10 @@ elif page == "评估分析":
                 </div>
             </div>
         </div>
-        """, unsafe_allow_html=True)
+        """)
 
-        with st.expander("查看案情描述", expanded=False):
-            st.text_area("", case.case_description, height=200, disabled=True, label_visibility="collapsed")
+        with st.expander("查看案情描述", expanded=True):
+            st.markdown(case.case_description)
 
         # ── 检查评估结果是否已在 session state ──
         eval_key = f"eval_results_{case_id}"
