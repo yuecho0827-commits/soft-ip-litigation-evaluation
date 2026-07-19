@@ -761,6 +761,7 @@ def _render_eval_moot_live_content(eval_data: dict) -> None:
         current_round.get("step_name", "模拟法庭"),
         current_round.get("content", ""),
         role_key,
+        truncate=400,
     )
     if len(rounds) > 1:
         previous_round = rounds[-2]
@@ -820,7 +821,10 @@ def _render_eval_rights_content(eval_data: dict) -> None:
     sub_scores = []
     for key, value in rights_r.get("sub_scores", {}).items():
         label = {"validity": "商标有效性", "usage_continuity": "连续使用", "coverage": "覆盖范围", "well_known_status": "驰名地位", "risk_of_invalidation": "无效风险"}.get(key, key)
-        sub_scores.append({"name": label, "score": value, "status": "pass" if value >= 60 else "warning"})
+        if isinstance(value, dict):
+            sub_scores.append({"name": label, "score": value.get("score", 0), "detail": value.get("reason", ""), "status": "pass" if value.get("score", 0) >= 60 else "warning"})
+        else:
+            sub_scores.append({"name": label, "score": value, "status": "pass" if value >= 60 else "warning"})
     dim_card(
         "1.1 权利基础评估",
         rights_r.get("score", 0),
@@ -829,7 +833,7 @@ def _render_eval_rights_content(eval_data: dict) -> None:
         extra="优势: " + ", ".join(rights_r.get("strengths", ["-"])) + "\n\n风险: " + ", ".join(rights_r.get("risks", ["-"])),
     )
     _render_dimension_alert(rights_r)
-    _render_cached_retrieval("北大法宝 · 法条检索（缓存）", external_cache.get("rights_retrieval", {}), "laws", True)
+    _render_cached_retrieval("北大法宝 · 法条检索", external_cache.get("rights_retrieval", {}), "laws", True)
 
 
 def _render_eval_infringement_content(eval_data: dict) -> None:
@@ -838,7 +842,7 @@ def _render_eval_infringement_content(eval_data: dict) -> None:
     el_items = [{"name": el.get("name", "未知要素"), "score": el.get("score", 0), "status": el.get("status", "pass"), "detail": el.get("analysis", "")} for el in infr_r.get("elements", [])]
     dim_card("1.2 侵权认定评估", infr_r.get("score", 0), infr_r.get("analysis", ""), sub_items=el_items)
     _render_dimension_alert(infr_r)
-    _render_cached_retrieval("北大法宝 · 类案检索（缓存）", external_cache.get("infringement_retrieval", {}), "mixed", True)
+    _render_cached_retrieval("北大法宝 · 类案检索", external_cache.get("infringement_retrieval", {}), "mixed", True)
 
 
 def _render_eval_procedure_content(eval_data: dict) -> None:
@@ -847,7 +851,7 @@ def _render_eval_procedure_content(eval_data: dict) -> None:
     proc_items = [{"name": item.get("name", "未知程序项"), "status": item.get("status", "pass"), "detail": item.get("detail", "")} for item in proc_r.get("items", [])]
     dim_card("1.3 诉讼程序审查", proc_r.get("score", 0), proc_r.get("analysis", ""), sub_items=proc_items)
     _render_dimension_alert(proc_r)
-    _render_cached_retrieval("北大法宝 · 法条检索（缓存）", external_cache.get("procedure_retrieval", {}), "laws", True)
+    _render_cached_retrieval("北大法宝 · 法条检索", external_cache.get("procedure_retrieval", {}), "laws", True)
 
 
 def _render_eval_moot_content(eval_data: dict) -> None:
@@ -905,7 +909,7 @@ def _render_eval_moot_content(eval_data: dict) -> None:
                 """,
                 unsafe_allow_html=True,
             )
-    _render_cached_retrieval("北大法宝 · 抗辩模式类案（缓存）", external_cache.get("moot_retrieval", {}), "cases", True)
+    _render_cached_retrieval("北大法宝 · 抗辩模式类案", external_cache.get("moot_retrieval", {}), "cases", True)
 
 
 def _render_eval_financial_content(eval_data: dict) -> None:
@@ -1049,7 +1053,7 @@ def _render_eval_financial_content(eval_data: dict) -> None:
     elif qcc_d.get("_summary"):
         accent_notice(qcc_d.get("_summary"))
 
-    _render_cached_retrieval("北大法宝 · 判赔数据类案（缓存）", external_cache.get("financial_retrieval", {}), "cases", True)
+    _render_cached_retrieval("北大法宝 · 判赔数据类案", external_cache.get("financial_retrieval", {}), "cases", True)
 
 
 def _render_eval_precedent_content(eval_data: dict, goal_type: str) -> None:
@@ -1059,7 +1063,7 @@ def _render_eval_precedent_content(eval_data: dict, goal_type: str) -> None:
     biz_s = eval_data.get("business_score", 0)
     dim_card("2.2 判例价值评估", prec_r.get("score", 0), prec_r.get("analysis", ""), extra=f"首案指数: {prec_r.get('first_case_index', '-')} | 影响力级别: {prec_r.get('influence_level', '-')}")
     _render_dimension_alert(prec_r)
-    _render_cached_retrieval("北大法宝 · 首案检索（缓存）", external_cache.get("precedent_retrieval", {}), "cases", True)
+    _render_cached_retrieval("北大法宝 · 首案检索", external_cache.get("precedent_retrieval", {}), "cases", True)
     accent_notice(f"维度二 业务预期综合得分: {biz_s} 分")
     if goal_type == "要钱":
         st.caption(f"公式: 0.9×财务({fin_r.get('score', 0)}) + 0.1×判例({prec_r.get('score', 0)}) = {biz_s}")
@@ -1672,7 +1676,7 @@ elif page == "评估分析":
         edit_toggle_key = f"editing_case_{case_id}"
 
         with st.container(key=f"eval_case_panel_{case_id}"):
-            st.markdown(
+            st.html(
                 f"""
                 <div class="eval-case-summary">
                     <div class="eval-case-summary-main">
@@ -1686,8 +1690,7 @@ elif page == "评估分析":
                         <span class="status-badge" style="background:{'#ffffff'};color:{st_color};border-color:{st_color};">{status_text}</span>
                     </div>
                 </div>
-                """,
-                unsafe_allow_html=True,
+                """
             )
 
             notice_message = st.session_state.pop(notice_key, None)
@@ -2403,19 +2406,25 @@ elif page == "模拟法庭":
 
                 if 'plaintiff' in str(role) or '原告' in str(role_name):
                     role_type = "plaintiff"
+                    chat_bubble(role_name, step_name, content, role_type, truncate=200)
                 elif 'defendant' in str(role) or '被告' in str(role_name):
                     role_type = "defendant"
+                    chat_bubble(role_name, step_name, content, role_type, truncate=200)
                 else:
                     role_type = "judge"
-                chat_bubble(role_name, step_name, content, role_type)
+                    chat_bubble(role_name, step_name, content, role_type)
 
-            # 法官归纳摘要 — 高亮显示
+            # 法官归纳摘要 — 高亮显示（焦点章节）
             judge_summary = moot_result.get('judge_summary', '')
             if judge_summary:
+                st.markdown("")
                 st.markdown(f"""
-                <div class="card" style="border:2px solid {COLORS['accent']};margin-top:20px;">
-                    <div style="font-size:0.72rem;color:{COLORS['accent']};text-transform:uppercase;letter-spacing:0.1em;margin-bottom:8px;font-weight:600;">法官最终归纳</div>
-                    <div style="font-size:0.88rem;color:#333;line-height:1.8;">{judge_summary}</div>
+                <div class="card" style="border:3px solid {COLORS['accent']};background:linear-gradient(135deg, #fffaf0 0%, #ffffff 100%);margin-top:24px;padding:18px 22px;">
+                    <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;">
+                        <span style="font-size:1.4rem;">⚖️</span>
+                        <span style="font-size:1.1rem;font-weight:800;color:{COLORS['accent']};letter-spacing:-0.01em;">法官最终判决</span>
+                    </div>
+                    <div style="font-size:0.95rem;color:#222;line-height:1.9;white-space:pre-wrap;">{judge_summary}</div>
                 </div>
                 """, unsafe_allow_html=True)
 

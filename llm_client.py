@@ -144,11 +144,11 @@ def evaluate_rights_foundation(case_description: str, party_info: str = "", uplo
 {{
   "score": 0-100,
   "sub_scores": {{
-    "validity": 0-100,
-    "usage_continuity": 0-100,
-    "coverage": 0-100,
-    "well_known_status": 0-100,
-    "risk_of_invalidation": 0-100 (分数越低=风险越高)
+    "validity": {{"score": 0-100, "reason": "1句话理由"}},
+    "usage_continuity": {{"score": 0-100, "reason": "1句话理由"}},
+    "coverage": {{"score": 0-100, "reason": "1句话理由"}},
+    "well_known_status": {{"score": 0-100, "reason": "1句话理由"}},
+    "risk_of_invalidation": {{"score": 0-100(分数越低=风险越高), "reason": "1句话理由"}}
   }},
   "analysis": "整体分析（150字以内）",
   "strengths": ["优势1", "优势2"],

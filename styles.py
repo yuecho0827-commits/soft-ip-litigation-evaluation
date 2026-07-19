@@ -1372,8 +1372,10 @@ def case_card(case_id, name, cause_type, goal_type, status, score=None, recommen
     """)
 
 
-def chat_bubble(role_name: str, step_name: str, content: str, role_type: str = "plaintiff"):
-    """模拟法庭聊天气泡 — 白底+左色条"""
+def chat_bubble(role_name: str, step_name: str, content: str, role_type: str = "plaintiff", truncate: int = 0):
+    """模拟法庭聊天气泡 — 白底+左色条
+    truncate: >0 时仅显示前 N 字，其余用 st.expander 折叠，无需 st.rerun()
+    """
     rc = ROLE_COLORS.get(role_type, ROLE_COLORS["plaintiff"])
     color = rc["color"]
 
@@ -1384,7 +1386,9 @@ def chat_bubble(role_name: str, step_name: str, content: str, role_type: str = "
     else:
         margin = "margin-right:15%;"
 
-    content_display = content if len(content) <= 1200 else content[:1200] + "\n\n...(内容过长，已截断)"
+    full_len = len(content)
+    needs_expand = truncate and full_len > truncate
+    content_display = content[:truncate] + "…" if needs_expand else content
 
     st.markdown(f"""
     <div class="chat-bubble" style="border-left-color:{color};{margin}">
@@ -1395,6 +1399,10 @@ def chat_bubble(role_name: str, step_name: str, content: str, role_type: str = "
         <div class="chat-bubble-content">{content_display}</div>
     </div>
     """, unsafe_allow_html=True)
+
+    if needs_expand:
+        with st.expander(f"展开全部（全文 {full_len} 字）"):
+            st.markdown(content)
 
 
 def metric_card(label: str, value: str, sub: str = "", color: str = None):
