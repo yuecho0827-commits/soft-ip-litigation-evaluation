@@ -926,14 +926,126 @@ def _render_eval_financial_content(eval_data: dict) -> None:
     _render_dimension_alert(fin_r)
 
     if qcc_d.get("status") == "completed" and qcc_d.get("stages"):
-        with st.expander("企查查 · 被告财务画像（缓存）", expanded=False):
+        stages = qcc_d.get("stages", {})
+        metrics = qcc_d.get("metrics", {})
+        defend_info = external_cache.get("defendant_info", {})
+        b_stage = stages.get("B_基本盘", {})
+        d_stage = stages.get("D_风险下钻", {})
+
+        with st.expander("🏢 企查查 · 被告财务画像（实时查询）", expanded=True):
+            # ── Phase 1: 被告识别 ──
+            if defend_info.get("name"):
+                dtype_label = {"enterprise": "企业", "individual": "自然人", "self_employed": "个体户"}.get(
+                    defend_info.get("type", ""), defend_info.get("type", ""))
+                hints = []
+                if defend_info.get("industry_hint"): hints.append(defend_info["industry_hint"])
+                if defend_info.get("scale_hint"): hints.append(defend_info["scale_hint"])
+                hint_text = f"（{' · '.join(hints)}）" if hints else ""
+                st.markdown(f"### 🔍 被告识别\n**{defend_info['name']}** · {dtype_label} {hint_text}")
+
+            # ── 关键项：注册资本 + 被执行 ──
+            reg_items = b_stage.get("工商登记", {}).get("_items", [])
+            reg_info = reg_items[0] if isinstance(reg_items, list) and reg_items else None
+            jdebt_count = d_stage.get("被执行人", {}).get("_count", 0) if d_stage else 0
+
+            if reg_info or jdebt_count is not None:
+                st.markdown("### 🔑 关键项")
+                k1, k2, k3, k4 = st.columns(4)
+                if isinstance(reg_info, dict):
+                    capital = reg_info.get("注册资本", reg_info.get("注册资金", "-"))
+                    paid = reg_info.get("实缴资本", reg_info.get("实缴资金", "-"))
+                    status = reg_info.get("登记状态", reg_info.get("企业状态", "-"))
+                    insured = reg_info.get("参保人数", "-")
+                    k1.metric("注册资本", f"{capital}", f"实缴{paid}" if paid and paid != capital else "")
+                else:
+                    k1.metric("注册资本", "-")
+                k2.metric("经营状态", status if reg_info else "-")
+                k3.metric("参保人数", f"{insured}人" if insured else "-")
+                if jdebt_count > 0:
+                    k4.metric("被执行", f"{jdebt_count}条", delta_color="inverse")
+                else:
+                    k4.metric("被执行", "无记录 ✅")
+
+            # ── 摘要 ──
             st.caption(qcc_d.get("_summary", ""))
-            metrics = qcc_d.get("metrics", {})
-            if metrics:
-                cols = st.columns(3)
-                cols[0].metric("回款概率", f"{metrics.get('recovery_probability', '-')}%")
-                cols[1].metric("判赔方向", metrics.get('damages_adjustment', '-'))
-                cols[2].metric("时间延长", f"+{metrics.get('time_extra_months', 0)}月")
+
+            # ── QCC 实测指标 ──
+            st.markdown("### 📊 QCC 实测指标")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("回款概率（QCC测算）", f"{metrics.get('recovery_probability', '-')}%")
+            c2.metric("判赔方向", metrics.get('damages_adjustment', '-'))
+            c3.metric("时间延长", f"+{metrics.get('time_extra_months', 0)}月")
+
+            reds = metrics.get("red_flags", [])
+            greens = metrics.get("green_flags", [])
+            if reds:
+                st.error("🚨 风险信号: " + " | ".join(reds))
+            if greens:
+                st.success("✅ 利好信号: " + " | ".join(greens))
+
+            # ── 主体锁定 ──
+            a = stages.get("A_主体锁定", {})
+            if a.get("locked_name"):
+                st.markdown("### 🎯 主体锁定")
+                st.markdown(f"**{a.get('locked_name')}**（信用代码: {a.get('credit_code', '-')}）")
+                candidates = a.get("candidates", [])
+                if len(candidates) > 1:
+                    with st.expander(f"查看更多候选（{len(candidates)}个）", expanded=False):
+                        for c in candidates:
+                            st.caption(f"- {c.get('name', '?')}")
+
+            # ── 基本盘 ──
+            if b_stage:
+                st.markdown("### 📋 基本盘（工商 / 财务 / 人员）")
+                b_lines = []
+                for label in ("企业简介", "财务数据", "上市信息", "分支机构", "对外投资", "年报", "核心人员", "实际控制人"):
+                    v = b_stage.get(label, {})
+                    if isinstance(v, dict) and v.get("_count", 0) > 0:
+                        b_lines.append(f"- **{label}**: {v.get('_summary', '-')}")
+                if b_lines:
+                    st.markdown("\n".join(b_lines))
+
+            # ── 风险明细 ──
+            c_stage = stages.get("C_风险分诊", {})
+            if d_stage:
+                st.markdown("### ⚠️ 风险明细")
+                risk_hit = []
+                for label in ("失信信息", "被执行人", "终本案件", "限高消费", "经营异常", "严重违法",
+                              "股权冻结", "动产抵押", "土地抵押", "股权出质", "司法拍卖",
+                              "欠税公告", "税收违法", "税务异常", "行政处罚", "惩戒名单", "违约信息",
+                              "裁判文书", "法院立案", "限制出境"):
+                    v = d_stage.get(label, {})
+                    if isinstance(v, dict) and v.get("_count", 0) > 0:
+                        risk_hit.append(f"- 🚨 **{label}**: {v.get('_summary', '-')}")
+                if risk_hit:
+                    st.markdown("\n".join(risk_hit))
+                else:
+                    st.success("✅ 无命中风险项")
+                if c_stage.get("_summary"):
+                    st.caption(f"风险分诊: {c_stage['_summary']}")
+
+            # ── 经营规模 ──
+            f_stage = stages.get("F_经营规模", {})
+            if f_stage:
+                st.markdown("### 🏭 经营规模与侵权渠道")
+                ch_lines = []
+                for label in ("商标资产", "线上店铺", "APP信息", "小程序", "微信公众号", "抖音账号",
+                              "招投标", "融资记录", "荣誉信息", "榜单排名", "招聘信息"):
+                    v = f_stage.get(label, {})
+                    if isinstance(v, dict):
+                        ch_lines.append(f"- **{label}**: {v.get('_summary', '-')}")
+                if ch_lines:
+                    st.markdown("\n".join(ch_lines))
+                if f_stage.get("_summary"):
+                    st.caption(f"汇总: {f_stage['_summary']}")
+
+            # ── 数据链说明 ──
+            st.markdown("---")
+            st.caption(
+                "📐 **数据链**: 案文 → DeepSeek NER 识别被告 → 企查查 MCP 实时查询 → 回款概率指标 → 注入 DeepSeek 财务分析\n\n"
+                "💡 上方「2.1 财务回报评估」卡片中的评分由 DeepSeek 综合北大法宝判赔数据 + 以上企查查实测指标后给出。"
+            )
+
     elif qcc_d.get("_summary"):
         accent_notice(qcc_d.get("_summary"))
 

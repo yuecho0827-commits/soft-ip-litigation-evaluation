@@ -174,8 +174,32 @@ def _extract_text(rpc_result: dict) -> str:
     return str(r)[:1000]
 
 
+def _is_empty_risk_wrapper(item: dict) -> bool:
+    """判断是否为 未发现任何记录 / 无记录 的包装响应"""
+    if not isinstance(item, dict):
+        return False
+    # QCC 风险工具在无记录时返回包装，包含多种"未发现"的表述
+    # 检查所有字符串字段
+    no_record_keywords = ["未发现", "未发现任何", "未查到", "无相关记录", "无记录", "当前无【", "当前无"]
+    for val in item.values():
+        if isinstance(val, str):
+            for kw in no_record_keywords:
+                if kw in val:
+                    return True
+    # 只含元数据、无实质内容的也过滤
+    if set(item.keys()) <= {"企业名称", "搜索结果", "检索关键字", "匹配结果", "摘要", "关联分析"}:
+        if item.get("匹配结果") == "未匹配":
+            return True
+    return False
+
+
+def _filter_empty(items: list) -> list:
+    """过滤掉 未发现任何记录 的包装项"""
+    return [it for it in items if not _is_empty_risk_wrapper(it)]
+
+
 def _extract_items(rpc_result: dict) -> list:
-    """从 JSON-RPC 结果中提取列表"""
+    """从 JSON-RPC 结果中提取列表，过滤 未发现任何记录 的包装响应"""
     if not rpc_result or "error" in rpc_result:
         return []
     r = rpc_result.get("result", {})
@@ -189,14 +213,14 @@ def _extract_items(rpc_result: dict) -> list:
             try:
                 parsed = json.loads(first["text"])
                 if isinstance(parsed, list):
-                    return parsed
+                    return _filter_empty(parsed)
                 if isinstance(parsed, dict):
                     # 可能是 {data: [...], total: N} 结构
                     for k in ("data", "Data", "items", "list"):
                         v = parsed.get(k, [])
                         if isinstance(v, list) and v:
-                            return v
-                    return [parsed] if parsed else []
+                            return _filter_empty(v)
+                    return _filter_empty([parsed])
             except (json.JSONDecodeError, TypeError):
                 return [{"_raw": first["text"]}]
 
@@ -204,7 +228,7 @@ def _extract_items(rpc_result: dict) -> list:
     for k in ("result", "Result", "Data", "data", "items", "item"):
         v = r.get(k, [])
         if isinstance(v, list) and v:
-            return v
+            return _filter_empty(v)
     return []
 
 
