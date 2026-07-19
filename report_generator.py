@@ -37,7 +37,7 @@ def generate_markdown_report(case_info: Dict, score_result: Dict, rule_results: 
 **评估时间**: {now}
 **案由**: {case_info.get('cause_type', '商标侵权')}
 **业务目标**: {case_info.get('goal_type', '未指定')}
-**客户**: {case_info.get('client_org', '未指定')}
+**我司主体**: {case_info.get('client_org', '未指定')}
 
 ---
 

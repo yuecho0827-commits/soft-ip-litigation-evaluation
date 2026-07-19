@@ -1331,7 +1331,7 @@ st.sidebar.markdown("""
         诉算
     </div>
     <div style="font-size:0.72rem;color:rgba(255,255,255,0.68);margin-top:6px;letter-spacing:0.12em;text-transform:uppercase;">
-        Soft IP Litigation Eval
+        Soft IP Litigation Evaluation
     </div>
 </div>
 """, unsafe_allow_html=True)
@@ -1479,7 +1479,7 @@ if page == "新建案件":
                 "案情描述 *", height=110, value=prefill,
                 placeholder="请详细描述案情，包括：\n- 原告商标信息（注册号、类别、有效期）\n- 被告侵权行为（何时发现、如何侵权）\n- 侵权商品销售情况\n- 已收集的证据"
             )
-            client_org = st.text_input("委托客户", placeholder="例如：某知名品牌公司")
+            client_org = st.text_input("我司主体名称", placeholder="例如：我司主体名称")
             goal_type = st.radio("业务目标", ["要钱", "要名"], horizontal=True)
 
             submitted = st.form_submit_button("创建案件并进入评估", type="primary", use_container_width=True)
@@ -1683,7 +1683,7 @@ elif page == "评估分析":
                         <div class="eval-case-summary-title">{case_name}</div>
                         <div class="eval-case-summary-meta">
                             ID: {case_id} &nbsp;|&nbsp; 案由: {case.cause_type} &nbsp;|&nbsp; 目标: {case.goal_type}
-                            {f' &nbsp;|&nbsp; 客户: {case.client_org}' if case.client_org else ''}
+                            {f' &nbsp;|&nbsp; 我司主体: {case.client_org}' if case.client_org else ''}
                         </div>
                     </div>
                     <div class="eval-case-summary-status">
@@ -1712,7 +1712,7 @@ elif page == "评估分析":
             if st.session_state.get(edit_toggle_key, False):
                 with st.form(f"edit_case_form_{case_id}"):
                     edited_name = st.text_input("案件名称 *", value=case.name or "")
-                    edited_client_org = st.text_input("委托客户", value=case.client_org or "")
+                    edited_client_org = st.text_input("我司主体名称", value=case.client_org or "")
                     goal_options = ["要钱", "要名"]
                     goal_index = goal_options.index(case.goal_type) if case.goal_type in goal_options else 0
                     edited_goal_type = st.radio("业务目标", goal_options, index=goal_index, horizontal=True)
