@@ -9,12 +9,17 @@ import urllib.request
 import urllib.error
 from typing import Dict, Any, Optional
 
-from config import DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL
+from config import get_runtime_settings
 
 
 def _call_llm(system_prompt: str, user_prompt: str, temperature: float = 0.2) -> dict:
     """调用 DeepSeek LLM，返回解析后的 JSON"""
-    url = f"{DEEPSEEK_BASE_URL}/v1/chat/completions"
+    settings = get_runtime_settings()
+    api_key = settings["deepseek_api_key"]
+    base_url = settings["deepseek_base_url"].rstrip("/")
+    if not api_key.strip():
+        raise RuntimeError("未配置 DEEPSEEK_API_KEY，真实 Demo 模式无法调用 DeepSeek")
+    url = f"{base_url}/v1/chat/completions"
     payload = json.dumps({
         "model": "deepseek-chat",
         "max_tokens": 4000,
@@ -26,7 +31,7 @@ def _call_llm(system_prompt: str, user_prompt: str, temperature: float = 0.2) ->
     }).encode("utf-8")
 
     req = urllib.request.Request(url, data=payload, method="POST")
-    req.add_header("Authorization", f"Bearer {DEEPSEEK_API_KEY}")
+    req.add_header("Authorization", f"Bearer {api_key}")
     req.add_header("Content-Type", "application/json")
 
     try:
@@ -598,3 +603,5 @@ def check_api_connection() -> bool:
         return True
     except Exception:
         return False
+
+

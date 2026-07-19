@@ -11,7 +11,9 @@ from pathlib import Path
 from typing import Dict, List, Optional
 from datetime import datetime
 
-DATA_DIR = Path(__file__).parent / "data"
+from config import RUNTIME_DIR
+
+DATA_DIR = RUNTIME_DIR
 
 
 def _queries_path(case_id: str) -> Path:

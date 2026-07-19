@@ -9,7 +9,8 @@ import urllib.request
 import urllib.error
 from typing import Dict
 
-TOKEN = "Bearer 2bacfbd2-d4f9-3f08-8332-c22c7883e6b6"
+from config import get_runtime_settings
+
 API_BASE = "https://apim-gateway.pkulaw.com"
 
 # 工具 → 端点
@@ -27,11 +28,31 @@ TOOL_ENDPOINTS = {
     "get_linked_content": "add-doc-link",
 }
 
-HEADERS = {
-    "Authorization": TOKEN,
-    "Content-Type": "application/json",
-    "Accept": "application/json, text/event-stream",
-}
+def _pkulaw_configured() -> bool:
+    return bool(get_runtime_settings().get("pkulaw_api_token", "").strip())
+
+
+def _pkulaw_headers() -> dict:
+    token = get_runtime_settings().get("pkulaw_api_token", "").strip()
+    if not token:
+        raise RuntimeError("未配置 PKULAW_API_TOKEN，无法调用北大法宝服务")
+    auth_value = token if token.lower().startswith("bearer ") else f"Bearer {token}"
+    return {
+        "Authorization": auth_value,
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
+
+
+def _pkulaw_unconfigured_result() -> Dict:
+    message = "未配置 PKULAW_API_TOKEN，北大法宝检索与验证已跳过"
+    return {
+        "status": "skipped",
+        "error": message,
+        "laws": [],
+        "cases": [],
+        "_summary": message,
+    }
 
 
 def _rpc_call(tool_name: str, args: dict) -> Dict:
@@ -45,7 +66,7 @@ def _rpc_call(tool_name: str, args: dict) -> Dict:
         "params": {"name": tool_name, "arguments": args},
     }
     try:
-        req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers=HEADERS)
+        req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers=_pkulaw_headers())
         with urllib.request.urlopen(req, timeout=25) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
     except Exception as e:
@@ -101,6 +122,8 @@ def _extract_items(rpc_result: dict) -> list:
 
 def search_for_rights_foundation() -> Dict:
     """1.1 权利基础：search_article + get_article"""
+    if not _pkulaw_configured():
+        return _pkulaw_unconfigured_result()
     result = {"laws": [], "cases": [], "_summary": ""}
     summary = []
 
@@ -141,6 +164,8 @@ def search_for_rights_foundation() -> Dict:
 
 def search_for_infringement() -> Dict:
     """1.2 侵权认定：search_case + search_article"""
+    if not _pkulaw_configured():
+        return _pkulaw_unconfigured_result()
     result = {"laws": [], "cases": [], "_summary": ""}
     summary = []
 
@@ -181,6 +206,8 @@ def search_for_infringement() -> Dict:
 
 def search_for_procedure() -> Dict:
     """1.3 诉讼程序：search_article"""
+    if not _pkulaw_configured():
+        return _pkulaw_unconfigured_result()
     result = {"laws": [], "cases": [], "_summary": ""}
     summary = []
 
@@ -205,6 +232,8 @@ def search_for_procedure() -> Dict:
 
 def search_for_moot_court() -> Dict:
     """1.4 模拟法庭：search_case（被告抗辩模式）"""
+    if not _pkulaw_configured():
+        return _pkulaw_unconfigured_result()
     result = {"laws": [], "cases": [], "_summary": ""}
     summary = []
 
@@ -231,6 +260,8 @@ def search_for_moot_court() -> Dict:
 
 def search_for_financial() -> Dict:
     """2.1 财务回报：search_case（判赔数据）"""
+    if not _pkulaw_configured():
+        return _pkulaw_unconfigured_result()
     result = {"laws": [], "cases": [], "_summary": ""}
     summary = []
 
@@ -258,6 +289,8 @@ def search_for_financial() -> Dict:
 
 def search_for_precedent(case_desc: str = "") -> Dict:
     """2.2 判例价值：search_case（首案判断）"""
+    if not _pkulaw_configured():
+        return _pkulaw_unconfigured_result()
     result = {"laws": [], "cases": [], "_summary": ""}
     summary = []
 
@@ -289,6 +322,20 @@ def search_for_precedent(case_desc: str = "") -> Dict:
 
 def run_verification_phase(report_md: str) -> Dict:
     """防幻觉验证：adjust_provisions → law_recognition → anhao_recognition(逐段) → search_case 交叉验证"""
+    if not _pkulaw_configured():
+        message = "未配置 PKULAW_API_TOKEN，北大法宝引用验证已跳过"
+        return {
+            "status": "skipped",
+            "error": message,
+            "_summary": message,
+            "summary": {
+                "laws_verified": False,
+                "cases_verified": False,
+                "laws_found": 0,
+                "cases_found": 0,
+                "hallucinations": [],
+            },
+        }
     result = {
         "adjust_provisions": {},
         "law_recognition": {},
@@ -349,6 +396,8 @@ def run_verification_phase(report_md: str) -> Dict:
 
 def get_linked_content(message: str) -> Dict:
     """为法律分析文本添加法宝超链接"""
+    if not _pkulaw_configured():
+        return {"status": "skipped", "error": "未配置 PKULAW_API_TOKEN，法宝超链增强已跳过"}
     if not message:
         return {"error": "message is empty"}
     return _rpc_call("get_linked_content", {"message": message})

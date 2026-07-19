@@ -2,35 +2,20 @@
 # Soft IP 主诉评估系统 - 启动脚本
 # 用法: bash start.sh
 
+set -e
+
 echo "========================================="
-echo "  ⚖️  Soft IP 主诉评估系统 v0.1.0"
+echo "  Soft IP 主诉评估系统 v0.1.0"
 echo "========================================="
 
-# 检查 Python
-if ! command -v python3 &> /dev/null; then
-    echo "❌ 未找到 Python 3，请先安装 Python 3"
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "Python 3 not found. Please install Python 3 first."
     exit 1
 fi
 
-echo "✅ Python $(python3 --version)"
+echo "Python: $(python3 --version)"
+echo "Installing dependencies..."
+python3 -m pip install -q -r requirements.txt
 
-# 安装依赖
-echo ""
-echo "📦 安装依赖..."
-pip3 install -q -r requirements.txt
-if [ $? -ne 0 ]; then
-    echo "❌ 依赖安装失败"
-    exit 1
-fi
-echo "✅ 依赖安装完成"
-
-# 启动
-echo ""
-echo "🚀 启动应用..."
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  浏览器将自动打开: http://localhost:8501"
-echo "  按 Ctrl+C 停止"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo ""
-
-streamlit run app.py
+echo "Starting Streamlit on http://localhost:8501"
+PYTHONIOENCODING=utf-8 STREAMLIT_BROWSER_GATHER_USAGE_STATS=false python3 -m streamlit run app.py --server.port 8501 --server.headless true --browser.gatherUsageStats false

@@ -20,7 +20,8 @@ def mock_delay():
 def evaluate_rights_foundation(
     case_description: str,
     party_info: str = "",
-    uploaded_texts: str = ""
+    uploaded_texts: str = "",
+    pkulaw_data: dict = None
 ) -> Dict[str, Any]:
     """
     子维度 1.1：权利基础评估
@@ -61,7 +62,8 @@ def evaluate_rights_foundation(
 def evaluate_infringement(
     case_description: str,
     rights_assessment: str = "",
-    uploaded_texts: str = ""
+    uploaded_texts: str = "",
+    pkulaw_data: dict = None
 ) -> Dict[str, Any]:
     """
     子维度 1.2：侵权认定评估（单方视角）
@@ -120,7 +122,8 @@ def evaluate_infringement(
 
 def evaluate_procedure(
     case_description: str,
-    party_info: str = ""
+    party_info: str = "",
+    pkulaw_data: dict = None
 ) -> Dict[str, Any]:
     """
     子维度 1.3：诉讼程序审查
@@ -212,7 +215,8 @@ def evaluate_financial_return(
 
 def evaluate_precedent_value(
     case_description: str,
-    case_law_references: str = ""
+    case_law_references: str = "",
+    pkulaw_data: dict = None
 ) -> Dict[str, Any]:
     """
     子维度 2.2：判例价值评估
@@ -298,6 +302,48 @@ def evaluate_evidence_readiness(
     }
 
 
+
+
+# ============================================================
+# Phase 1: 被告身份提取（Mock）
+# ============================================================
+
+def extract_defendant_info(case_description: str) -> Dict[str, Any]:
+    """Mock 模式下返回最小可用的被告识别结果。"""
+    mock_delay()
+
+    name = "被告企业"
+    match = None
+    import re
+    patterns = [
+        r"被告[:：]?([\u4e00-\u9fa5A-Za-z0-9（）()·\-]{2,40}(?:公司|有限公司|股份有限公司|店|经营部|工作室))",
+        r"诉([\u4e00-\u9fa5A-Za-z0-9（）()·\-]{2,40}(?:公司|有限公司|股份有限公司|店|经营部|工作室))",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, case_description or "")
+        if match:
+            name = match.group(1).strip()
+            break
+
+    return {
+        "defendants": [
+            {
+                "name": name,
+                "aliases": [],
+                "type": "enterprise",
+                "role": "primary_defendant",
+                "location_hint": "",
+                "industry_hint": "",
+                "scale_hint": "",
+                "known_financial_context": "",
+                "extracted_from": match.group(0) if match else "mock fallback",
+                "confidence": 0.65 if match else 0.3,
+            }
+        ],
+        "uncertainties": [] if match else ["未在案情中识别到明确被告名称，已使用 Mock 默认主体"],
+        "total_defendants": 1,
+        "error": None,
+    }
 # ============================================================
 # 模拟法庭 Mock - 多Agent五步庭审
 # 返回结构与 moot_court.procedure.run_moot_court 一致
@@ -307,7 +353,8 @@ def run_moot_court_simulation(
     case_description: str,
     rights_assessment: str = "",
     infringement_assessment: str = "",
-    evidence_summary: str = ""
+    evidence_summary: str = "",
+    pkulaw_data: dict = None
 ) -> Dict[str, Any]:
     """
     运行模拟法庭（Mock 模式）
@@ -548,3 +595,5 @@ def run_moot_court_simulation(
         },
         "error": None
     }
+
+

@@ -5,13 +5,17 @@ SQLite 数据库，适合原型开发
 
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, Float, JSON, ForeignKey
 from sqlalchemy.orm import sessionmaker, relationship, declarative_base
+from sqlalchemy.pool import StaticPool
 from datetime import datetime
 import uuid
 
 from config import SQLITE_URL
 
 # 创建数据库引擎
-engine = create_engine(SQLITE_URL, connect_args={"check_same_thread": False})
+_engine_kwargs = {"connect_args": {"check_same_thread": False}}
+if SQLITE_URL == "sqlite:///:memory:":
+    _engine_kwargs["poolclass"] = StaticPool
+engine = create_engine(SQLITE_URL, **_engine_kwargs)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -28,7 +32,7 @@ class Case(Base):
     cause_type = Column(String(50), default="商标侵权")
     goal_type = Column(String(50))  # 要钱 / 要名
     client_org = Column(String(200))
-    status = Column(String(50), default="draft")  # draft, evaluating, completed
+    status = Column(String(50), default="pending")  # pending/draft, evaluating, partial, completed
     case_description = Column(Text)
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
@@ -186,7 +190,7 @@ class Report(Base):
 def init_db():
     """初始化数据库"""
     Base.metadata.create_all(bind=engine)
-    print("✅ 数据库初始化完成")
+    print("Database initialized.")
 
 def get_db():
     """获取数据库会话"""
@@ -198,3 +202,6 @@ def get_db():
 
 if __name__ == "__main__":
     init_db()
+
+
+

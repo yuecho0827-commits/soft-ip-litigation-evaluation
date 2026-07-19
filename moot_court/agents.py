@@ -13,7 +13,7 @@ import urllib.request
 import urllib.error
 from typing import Dict, Any, Optional
 
-from config import DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, USE_MOCK
+from config import get_runtime_settings
 
 from . import prompts
 
@@ -27,7 +27,12 @@ def call_llm_text(system_prompt: str, user_prompt: str, temperature: float = 0.3
     调用 DeepSeek API，返回纯文本（不解析 JSON）
     用于原告/被告 Agent 的发言生成
     """
-    url = f"{DEEPSEEK_BASE_URL}/v1/chat/completions"
+    settings = get_runtime_settings()
+    api_key = settings["deepseek_api_key"]
+    base_url = settings["deepseek_base_url"].rstrip("/")
+    if not api_key.strip():
+        raise RuntimeError("未配置 DEEPSEEK_API_KEY，真实 Demo 模式无法调用 DeepSeek")
+    url = f"{base_url}/v1/chat/completions"
     payload = json.dumps({
         "model": "deepseek-chat",
         "max_tokens": 2000,
@@ -39,7 +44,7 @@ def call_llm_text(system_prompt: str, user_prompt: str, temperature: float = 0.3
     }).encode("utf-8")
 
     req = urllib.request.Request(url, data=payload, method="POST")
-    req.add_header("Authorization", f"Bearer {DEEPSEEK_API_KEY}")
+    req.add_header("Authorization", f"Bearer {api_key}")
     req.add_header("Content-Type", "application/json")
 
     try:
@@ -57,7 +62,12 @@ def call_llm_json(system_prompt: str, user_prompt: str, temperature: float = 0.2
     调用 DeepSeek API，返回解析后的 JSON dict
     用于法官 Agent 的结构化归纳
     """
-    url = f"{DEEPSEEK_BASE_URL}/v1/chat/completions"
+    settings = get_runtime_settings()
+    api_key = settings["deepseek_api_key"]
+    base_url = settings["deepseek_base_url"].rstrip("/")
+    if not api_key.strip():
+        raise RuntimeError("未配置 DEEPSEEK_API_KEY，真实 Demo 模式无法调用 DeepSeek")
+    url = f"{base_url}/v1/chat/completions"
     payload = json.dumps({
         "model": "deepseek-chat",
         "max_tokens": 4000,
@@ -69,7 +79,7 @@ def call_llm_json(system_prompt: str, user_prompt: str, temperature: float = 0.2
     }).encode("utf-8")
 
     req = urllib.request.Request(url, data=payload, method="POST")
-    req.add_header("Authorization", f"Bearer {DEEPSEEK_API_KEY}")
+    req.add_header("Authorization", f"Bearer {api_key}")
     req.add_header("Content-Type", "application/json")
 
     try:

@@ -10,7 +10,8 @@ import urllib.error
 from datetime import datetime
 from typing import Dict, List, Optional, Any
 
-TOKEN = "Bearer MCkydMZpcNOoyQp6jQpGICjKt2fT6bP3r6OdDAcNTqMAs01B"
+from config import get_runtime_settings
+
 API_BASE = "https://agent.qcc.com/mcp"
 
 # 工具 → 所属 Server
@@ -96,11 +97,31 @@ TOOL_SERVER = {
     "get_judicial_case_search": "case",
 }
 
-HEADERS = {
-    "Authorization": TOKEN,
-    "Content-Type": "application/json",
-    "Accept": "application/json, text/event-stream",
-}
+def _qcc_configured() -> bool:
+    return bool(get_runtime_settings().get("qcc_api_token", "").strip())
+
+
+def _qcc_headers() -> dict:
+    token = get_runtime_settings().get("qcc_api_token", "").strip()
+    if not token:
+        raise RuntimeError("未配置 QCC_API_TOKEN，无法调用企查查服务")
+    auth_value = token if token.lower().startswith("bearer ") else f"Bearer {token}"
+    return {
+        "Authorization": auth_value,
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
+
+
+def _qcc_unconfigured_result() -> Dict:
+    message = "未配置 QCC_API_TOKEN，企查查画像已跳过"
+    return {
+        "status": "skipped",
+        "error": message,
+        "_summary": message,
+        "stages": {},
+        "metrics": {},
+    }
 
 
 def _rpc_call(tool_name: str, args: dict, server: str = None) -> Dict:
@@ -115,7 +136,7 @@ def _rpc_call(tool_name: str, args: dict, server: str = None) -> Dict:
         "params": {"name": tool_name, "arguments": args},
     }
     try:
-        req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers=HEADERS)
+        req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers=_qcc_headers())
         with urllib.request.urlopen(req, timeout=30) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
     except Exception as e:
@@ -215,6 +236,8 @@ def search_for_financial_qcc_full(defendant_info: dict = None) -> Dict:
       至少包含 name, type 字段；可选 aliases, location_hint, industry_hint
     返回: {_summary, stages:{...}, metrics:{...}}
     """
+    if not _qcc_configured():
+        return _qcc_unconfigured_result()
     # 兼容旧版字符串调用
     if isinstance(defendant_info, str):
         defendant_info = {"name": defendant_info, "type": "enterprise"}
@@ -870,6 +893,8 @@ def _search_individual(d: dict) -> Dict:
 
 def check_qcc_connection() -> bool:
     """检查企查查 API 连通性"""
+    if not _qcc_configured():
+        return False
     try:
         r = _rpc_call("get_company_by_query", {"searchKey": "腾讯"}, server="company")
         return "error" not in r

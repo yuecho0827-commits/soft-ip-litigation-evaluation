@@ -22,3 +22,8 @@ Thumbs.db
 
 # WorkBuddy
 .workbuddy/
+# Runtime outputs
+runtime/
+.user_data/
+soft_ip_runtime.db
+*.db

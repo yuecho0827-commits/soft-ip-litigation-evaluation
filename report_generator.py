@@ -6,21 +6,31 @@
 from typing import Dict, Any, List
 from datetime import datetime
 from reportlab.lib.pagesizes import A4
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib import colors
 from reportlab.lib.units import cm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 import os
+from config import REPORT_DIR
+
+
+def _display_score(value: Any, suffix: str = "") -> str:
+    if value is None or value == "":
+        return "未生成"
+    return f"{value}{suffix}"
+
 
 def generate_markdown_report(case_info: Dict, score_result: Dict, rule_results: List, legal_analysis: Dict) -> str:
-    """
-    生成 Markdown 格式评估报告
-    """
+    """生成 Markdown 格式评估报告。"""
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    data_integrity = score_result.get("data_integrity", {})
+    integrity_label = data_integrity.get("label", "完整" if data_integrity.get("is_complete", True) else "部分完成")
+    critical_issues = data_integrity.get("critical_issues", [])
+    optional_issues = data_integrity.get("optional_issues", [])
 
-    # 标题
     md = f"""# Soft IP 主诉评估报告
 
 **案件名称**: {case_info.get('name', '未命名案件')}
@@ -34,35 +44,39 @@ def generate_markdown_report(case_info: Dict, score_result: Dict, rule_results: 
 ## 一、结论摘要
 
 **总体建议**: {score_result.get('recommendation', '待评估')}
-**综合评分**: {score_result.get('final_score', 'N/A')} 分（满分100分）
-**置信度**: {score_result.get('confidence_score', 'N/A')}%
+**综合评分**: {_display_score(score_result.get('final_score'), ' 分（满分100分）')}
+**置信度**: {_display_score(score_result.get('confidence_score'), '%')}
+**数据完整性**: {integrity_label}
 
 {score_result.get('reason', '')}
 
 """
 
-    # 行动建议
+    if critical_issues:
+        md += "**关键未完成项**: " + "、".join(critical_issues) + "\n\n"
+    if optional_issues:
+        md += "**非关键异常项**: " + "、".join(optional_issues) + "\n\n"
+    if not data_integrity.get("is_complete", True):
+        md += "> 当前报告包含失败或未完成维度，仅供查看已完成分析，不作为完整综合结论。\n\n"
+
     action_items = score_result.get('action_items', [])
     if action_items:
-        md += "\n### 建议行动\n"
+        md += "### 建议行动\n"
         for i, item in enumerate(action_items, 1):
             md += f"{i}. {item}\n"
 
     md += "\n---\n\n"
-
-    # 三维评分
     md += """## 二、三维评分总览
 
 | 维度 | 得分 | 权重 | 说明 |
 |------|------|------|------|
 """
-    md += f"| 法律可行性 | {score_result.get('legal_feasibility', 'N/A')} | 45% | 权利基础、侵权认定、程序合规 |\n"
-    md += f"| 业务预期 | {score_result.get('business_expectation', 'N/A')} | 25% | 赔偿预期、成本控制 |\n"
-    md += f"| 证据就绪度 | {score_result.get('evidence_readiness', 'N/A')} | 30% | 证据完整性、证明力 |\n"
-    md += f"\n**最终得分**: {score_result.get('final_score', 'N/A')}\n\n"
+    md += f"| 法律可行性 | {_display_score(score_result.get('legal_feasibility'))} | 45% | 权利基础、侵权认定、程序合规 |\n"
+    md += f"| 业务预期 | {_display_score(score_result.get('business_expectation'))} | 25% | 赔偿预期、成本控制 |\n"
+    md += f"| 证据就绪度 | {_display_score(score_result.get('evidence_readiness'))} | 30% | 证据完整性、证明力 |\n"
+    md += f"\n**最终得分**: {_display_score(score_result.get('final_score'))}\n\n"
     md += "---\n\n"
 
-    # 红线风险
     md += """## 三、红线风险检查
 
 """
@@ -71,21 +85,19 @@ def generate_markdown_report(case_info: Dict, score_result: Dict, rule_results: 
         rule_name = rule.get("rule_name", rule.get("name", "未知规则"))
         result = rule.get("result", rule.get("detail", rule.get("status", "通过")))
         reason = rule.get("reason", rule.get("detail", ""))
-        status_icon = "✅" if severity == "pass" else ("⚠️" if severity == "warning" else "🚫")
-        md += f"### {status_icon} {rule_name}\n\n"
+        status_icon = "PASS" if severity == "pass" else ("WARN" if severity == "warning" else "BLOCK")
+        md += f"### [{status_icon}] {rule_name}\n\n"
         md += f"**结果**: {result}\n\n"
         md += f"**说明**: {reason}\n\n"
 
     md += "---\n\n"
-
-    # 法律要件分析
     md += """## 四、法律要件分析
 
 """
     elements = legal_analysis.get("elements", [])
     for element in elements:
         md += f"### {element.get('element', '未知要件')}\n\n"
-        md += f"**评分**: {element.get('score', 'N/A')} 分\n\n"
+        md += f"**评分**: {_display_score(element.get('score'), ' 分')}\n\n"
         md += f"**分析**: {element.get('analysis', '')}\n\n"
         md += f"**证据状态**: {element.get('evidence_status', '未评估')}\n\n"
 
@@ -97,8 +109,6 @@ def generate_markdown_report(case_info: Dict, score_result: Dict, rule_results: 
             md += "\n"
 
     md += "---\n\n"
-
-    # 证据矩阵（简化）
     md += """## 五、证据缺口诊断
 
 （详细证据矩阵请在系统中查看）
@@ -110,8 +120,6 @@ def generate_markdown_report(case_info: Dict, score_result: Dict, rule_results: 
             md += f"- {rule.get('reason', '')}\n"
 
     md += "\n---\n\n"
-
-    # 附录
     md += f"""## 六、附录
 
 **评估模型版本**: v0.1.0 MVP
@@ -121,46 +129,55 @@ def generate_markdown_report(case_info: Dict, score_result: Dict, rule_results: 
 ---
 *报告生成时间: {now}*
 """
-
     return md
 
-def generate_pdf_bytes(markdown_content: str) -> bytes:
-    """
-    将 Markdown 报告转为 PDF 并返回 bytes（用于 Streamlit download_button）
-    """
-    import os, io, re
-    from reportlab.pdfbase import pdfmetrics
-    from reportlab.pdfbase.ttfonts import TTFont
 
-    # 注册中文字体（macOS + Linux 多路径）
-    font_paths = [
-        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",   # Debian/Ubuntu (packages.txt)
-        "/System/Library/Fonts/STHeiti Light.ttc",          # macOS
-        "/System/Library/Fonts/STHeiti Medium.ttc",          # macOS
-        "/System/Library/Fonts/Supplemental/Songti.ttc",     # macOS
+def _register_chinese_font() -> str:
+    """按平台尝试注册中文字体，失败时退回内置中文字体。"""
+    font_candidates = [
+        r"C:\Windows\Fonts\simhei.ttf",
+        r"C:\Windows\Fonts\msyh.ttc",
+        r"C:\Windows\Fonts\simsun.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
         "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/System/Library/Fonts/STHeiti Light.ttc",
+        "/System/Library/Fonts/STHeiti Medium.ttc",
+        "/System/Library/Fonts/Supplemental/Songti.ttc",
     ]
 
-    cn_font_name = "Helvetica"
-    for fp in font_paths:
-        if os.path.exists(fp):
-            try:
-                pdfmetrics.registerFont(TTFont("ChineseFont", fp))
-                cn_font_name = "ChineseFont"
-                break
-            except Exception:
-                continue
+    for font_path in font_candidates:
+        if not os.path.exists(font_path):
+            continue
+        try:
+            pdfmetrics.registerFont(TTFont("ChineseFont", font_path))
+            return "ChineseFont"
+        except Exception:
+            continue
 
+    try:
+        pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
+        return "STSong-Light"
+    except Exception:
+        return "Helvetica"
+
+
+def generate_pdf_bytes(markdown_content: str) -> bytes:
+    """将 Markdown 报告转为 PDF 并返回 bytes。"""
+    import io
+    import re
+    from reportlab.lib.enums import TA_CENTER
+
+    cn_font_name = _register_chinese_font()
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
-        buf, pagesize=A4,
-        rightMargin=2*cm, leftMargin=2*cm,
-        topMargin=2*cm, bottomMargin=2*cm
+        buf,
+        pagesize=A4,
+        rightMargin=2 * cm,
+        leftMargin=2 * cm,
+        topMargin=2 * cm,
+        bottomMargin=2 * cm,
     )
-
-    from reportlab.lib.styles import ParagraphStyle
-    from reportlab.lib.enums import TA_CENTER
 
     title_style = ParagraphStyle(
         'ChineseTitle', fontName=cn_font_name,
@@ -188,16 +205,16 @@ def generate_pdf_bytes(markdown_content: str) -> bytes:
     for line in lines:
         stripped = line.strip()
         if not stripped:
-            story.append(Spacer(1, 0.3*cm))
+            story.append(Spacer(1, 0.3 * cm))
             continue
 
         parts = re.split(r'(\*\*.*?\*\*)', stripped)
         para_parts = []
-        for p in parts:
-            if p.startswith('**') and p.endswith('**'):
-                para_parts.append(f'<b>{p[2:-2]}</b>')
+        for part in parts:
+            if part.startswith('**') and part.endswith('**'):
+                para_parts.append(f'<b>{part[2:-2]}</b>')
             else:
-                para_parts.append(p)
+                para_parts.append(part)
         text = ''.join(para_parts)
 
         if stripped.startswith('# ') and not stripped.startswith('## '):
@@ -209,8 +226,8 @@ def generate_pdf_bytes(markdown_content: str) -> bytes:
         elif stripped.startswith('|') and '---' not in stripped:
             cells = [c.strip() for c in stripped.split('|')[1:-1]]
             if cells:
-                t = Table([cells], colWidths=[doc.width/len(cells)]*len(cells))
-                t.setStyle(TableStyle([
+                table = Table([cells], colWidths=[doc.width / len(cells)] * len(cells))
+                table.setStyle(TableStyle([
                     ('FONTNAME', (0, 0), (-1, -1), cn_font_name),
                     ('FONTSIZE', (0, 0), (-1, -1), 9),
                     ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#f0f0f0')),
@@ -219,54 +236,57 @@ def generate_pdf_bytes(markdown_content: str) -> bytes:
                     ('TOPPADDING', (0, 0), (-1, -1), 4),
                     ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
                 ]))
-                story.append(t)
+                story.append(table)
         elif stripped.startswith('- '):
-            story.append(Paragraph(f"• {text[2:]}", body_style))
+            story.append(Paragraph(f'• {text[2:]}', body_style))
         elif stripped.startswith('---'):
-            story.append(Spacer(1, 0.5*cm))
+            story.append(Spacer(1, 0.5 * cm))
         else:
             story.append(Paragraph(text, body_style))
 
     doc.build(story)
     return buf.getvalue()
 
+
 def generate_pdf_report(markdown_content: str, output_path: str) -> bool:
-    """将 Markdown 报告保存为 PDF 文件"""
+    """将 Markdown 报告保存为 PDF 文件。"""
     try:
         pdf_bytes = generate_pdf_bytes(markdown_content)
-        with open(output_path, 'wb') as f:
-            f.write(pdf_bytes)
+        with open(output_path, 'wb') as file_obj:
+            file_obj.write(pdf_bytes)
         return True
-    except Exception as e:
-        print(f"PDF 生成失败: {e}")
+    except Exception as exc:
+        print(f"PDF generation failed: {exc}")
         return False
 
-def save_report(case_id: str, markdown_content: str, output_dir: str = "data/reports") -> str:
-    """
-    保存报告到文件
-    返回文件路径
-    """
+
+def save_report(case_id: str, markdown_content: str, output_dir: str = None) -> str:
+    """保存 Markdown 与 PDF 报告文件。"""
+    output_dir = output_dir or str(REPORT_DIR)
     os.makedirs(output_dir, exist_ok=True)
 
-    # 保存 Markdown
     md_path = os.path.join(output_dir, f"{case_id}_report.md")
-    with open(md_path, 'w', encoding='utf-8') as f:
-        f.write(markdown_content)
+    with open(md_path, 'w', encoding='utf-8') as file_obj:
+        file_obj.write(markdown_content)
 
-    # 生成 PDF
     pdf_path = os.path.join(output_dir, f"{case_id}_report.pdf")
     try:
         generate_pdf_report(markdown_content, pdf_path)
-    except Exception as e:
-        print(f"PDF 生成失败: {e}")
+    except Exception as exc:
+        print(f"PDF generation failed: {exc}")
         pdf_path = None
 
     return md_path, pdf_path
 
+
 if __name__ == "__main__":
-    # 测试
     test_case = {"name": "测试案件", "cause_type": "商标侵权"}
-    test_score = {"recommendation": "建议起诉", "final_score": 75, "confidence_score": 70}
+    test_score = {
+        "recommendation": "建议起诉",
+        "final_score": 75,
+        "confidence_score": 70,
+        "data_integrity": {"is_complete": True, "label": "完整"},
+    }
     test_rules = []
     test_analysis = {"elements": []}
 

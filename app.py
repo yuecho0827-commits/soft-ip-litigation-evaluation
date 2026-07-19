@@ -7,15 +7,19 @@ import streamlit as st
 import sys
 import os
 import math
+import time
 import re
+import json
 import base64
 from pathlib import Path
 from datetime import datetime
 
+from sqlalchemy.exc import OperationalError
+
 sys.path.append(str(Path(__file__).parent))
 
-from config import APP_TITLE, APP_VERSION, USE_MOCK
-from database import init_db, SessionLocal, Case, Party, RuleHit, ScoreSnapshot, Report
+from config import APP_TITLE, APP_VERSION, get_runtime_configuration_status, get_runtime_settings, save_runtime_settings
+from database import init_db, SessionLocal, Case, Party, RuleHit, RetrievalRecord, ScoreSnapshot, Report
 from evidence_parser import parse_pdf, ocr_image, is_pdf_file, is_image_file
 from report_generator import generate_markdown_report, generate_pdf_bytes
 from pkulaw_api import (
@@ -27,44 +31,69 @@ from qcc_api import search_for_financial_qcc_full
 from styles import (
     inject_global_css, page_header, section_banner, dim_card,
     score_bar, final_score_card, case_card, chat_bubble,
-    metric_card, form_section_title, COLORS, ROLE_COLORS
+    metric_card, form_section_title, empty_state_notice, accent_notice, COLORS, ROLE_COLORS
 )
 
 # 评估引擎
-if USE_MOCK:
-    from mock_llm import (
-        evaluate_rights_foundation,
-        evaluate_infringement,
-        evaluate_procedure,
-        evaluate_financial_return,
-        evaluate_precedent_value,
-        evaluate_evidence_readiness,
-        run_moot_court_simulation,
-    )
-    _mock = True
-else:
-    from llm_client import (
-        evaluate_rights_foundation,
-        evaluate_infringement,
-        evaluate_procedure,
-        evaluate_financial_return,
-        evaluate_precedent_value,
-        evaluate_evidence_readiness,
-        extract_defendant_info,
-    )
-    from moot_court import run_moot_court as run_moot_court_simulation
-    _mock = False
+import llm_client
+import mock_llm
+from moot_court import MootCourtProcedure, MootCourtResult, run_moot_court as run_moot_court_real
+
+
+def _use_mock_mode() -> bool:
+    return bool(RUNTIME_CONFIG.get("use_mock", False))
+
+
+def _call_runtime_eval(name: str, *args, **kwargs):
+    module = mock_llm if _use_mock_mode() else llm_client
+    return getattr(module, name)(*args, **kwargs)
+
+
+def evaluate_rights_foundation(*args, **kwargs):
+    return _call_runtime_eval("evaluate_rights_foundation", *args, **kwargs)
+
+
+def evaluate_infringement(*args, **kwargs):
+    return _call_runtime_eval("evaluate_infringement", *args, **kwargs)
+
+
+def evaluate_procedure(*args, **kwargs):
+    return _call_runtime_eval("evaluate_procedure", *args, **kwargs)
+
+
+def evaluate_financial_return(*args, **kwargs):
+    return _call_runtime_eval("evaluate_financial_return", *args, **kwargs)
+
+
+def evaluate_precedent_value(*args, **kwargs):
+    return _call_runtime_eval("evaluate_precedent_value", *args, **kwargs)
+
+
+def evaluate_evidence_readiness(*args, **kwargs):
+    return _call_runtime_eval("evaluate_evidence_readiness", *args, **kwargs)
+
+
+def extract_defendant_info(*args, **kwargs):
+    return _call_runtime_eval("extract_defendant_info", *args, **kwargs)
+
+
+def run_moot_court_simulation(*args, **kwargs):
+    if _use_mock_mode():
+        return mock_llm.run_moot_court_simulation(*args, **kwargs)
+    return run_moot_court_real(*args, **kwargs)
 
 from legal_rules import run_rule_engine
 from scoring import (
     calculate_legal_feasibility,
     calculate_business_expectation,
     calculate_overall_score,
+    calculate_confidence_score,
+    evaluate_data_integrity,
     generate_recommendation,
 )
 from legal_database import format_laws_for_report, format_cases_for_report
 from pkulaw_integration import (
-    generate_all_queries, load_results, get_validation_status, get_dimension_results
+    generate_all_queries, save_results, get_validation_status
 )
 
 # ============================================================
@@ -85,6 +114,944 @@ def _init_db():
     init_db()
     return True
 _init_db()
+
+RUNTIME_CONFIG = get_runtime_configuration_status()
+RUNTIME_DIR = Path(RUNTIME_CONFIG.get("runtime_dir") or (Path(__file__).parent / "runtime"))
+EVAL_CACHE_DIR = RUNTIME_DIR
+CRITICAL_DIMENSIONS = ["rights", "infringement", "procedure", "financial", "precedent", "evidence"]
+DIMENSION_LABELS = {
+    "rights": "权利基础",
+    "infringement": "侵权认定",
+    "procedure": "诉讼程序",
+    "moot": "模拟法庭",
+    "financial": "财务回报",
+    "precedent": "判例价值",
+    "evidence": "证据就绪度",
+}
+RETRIEVAL_LABELS = {
+    "rights_retrieval": "权利基础法条检索",
+    "infringement_retrieval": "侵权认定类案检索",
+    "procedure_retrieval": "程序法条检索",
+    "moot_retrieval": "抗辩模式检索",
+    "financial_retrieval": "判赔数据检索",
+    "precedent_retrieval": "首案检索",
+}
+EVAL_FLOW_STEPS = [
+    {"id": "rights", "full_title": "1.1 权利基础", "source": "来源：模型分析 + 北大法宝法条缓存"},
+    {"id": "infringement", "full_title": "1.2 侵权认定", "source": "来源：模型分析 + 北大法宝类案缓存"},
+    {"id": "procedure", "full_title": "1.3 诉讼程序", "source": "来源：模型分析 + 北大法宝程序法条缓存"},
+    {"id": "moot", "full_title": "1.4 模拟法庭", "source": "来源：多 Agent 对抗检验 + 北大法宝抗辩模式缓存"},
+    {"id": "financial", "full_title": "2.1 财务回报", "source": "来源：模型分析 + 北大法宝判赔缓存 + 企查查画像"},
+    {"id": "precedent", "full_title": "2.2 判例价值", "source": "来源：模型分析 + 北大法宝首案检索缓存"},
+    {"id": "evidence", "full_title": "3 证据就绪度", "source": "来源：模型分析 + 已上传证据文本"},
+]
+EVAL_FLOW_GROUPS = [
+    ("法律可行性", ["rights", "infringement", "procedure", "moot"]),
+    ("业务预期", ["financial", "precedent"]),
+    ("证据就绪度", ["evidence"]),
+]
+EVAL_FLOW_MAP = {step["id"]: step for step in EVAL_FLOW_STEPS}
+
+
+def _eval_cache_path(case_id: str) -> Path:
+    EVAL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    return EVAL_CACHE_DIR / f"eval_results_{case_id}.json"
+
+
+def _load_eval_cache(case_id: str):
+    path = _eval_cache_path(case_id)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _save_eval_cache(case_id: str, payload: dict) -> None:
+    _eval_cache_path(case_id).write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _case_status_label(status: str) -> str:
+    return {
+        "draft": "待评估",
+        "pending": "待评估",
+        "evaluating": "评估中",
+        "partial": "部分完成",
+        "completed": "已完成",
+    }.get(status or "pending", "未知")
+
+
+def _case_status_text_color(status: str) -> str:
+    return {
+        "draft": COLORS["text_muted"],
+        "pending": COLORS["text_muted"],
+        "evaluating": COLORS["warning"],
+        "partial": COLORS["warning"],
+        "completed": COLORS["accent"],
+    }.get(status or "pending", COLORS["text_muted"])
+
+
+def _pkulaw_cache_path(case_id: str) -> Path:
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    return RUNTIME_DIR / f"pkulaw_results_{case_id}.json"
+
+
+def _clear_case_runtime_state(case_id: str) -> None:
+    for path in (_eval_cache_path(case_id), _pkulaw_cache_path(case_id), RUNTIME_DIR / "reports" / f"{case_id}_report.md"):
+        try:
+            if path.exists():
+                path.unlink()
+        except Exception:
+            pass
+
+    for key in [
+        f"eval_results_{case_id}",
+        f"rights_{case_id}",
+        f"infringement_{case_id}",
+        f"procedure_{case_id}",
+        f"moot_{case_id}",
+        f"financial_{case_id}",
+        f"precedent_{case_id}",
+        f"evidence_{case_id}",
+    ]:
+        st.session_state.pop(key, None)
+
+
+def _reset_case_outputs(db, case_id: str) -> None:
+    report_rows = db.query(Report).filter(Report.case_id == case_id).all()
+    for report_row in report_rows:
+        if not report_row.pdf_uri:
+            continue
+        try:
+            report_path = Path(report_row.pdf_uri)
+            if report_path.exists():
+                report_path.unlink()
+        except Exception:
+            pass
+
+    db.query(RetrievalRecord).filter(RetrievalRecord.case_id == case_id).delete(synchronize_session=False)
+    db.query(ScoreSnapshot).filter(ScoreSnapshot.case_id == case_id).delete(synchronize_session=False)
+    db.query(Report).filter(Report.case_id == case_id).delete(synchronize_session=False)
+    _clear_case_runtime_state(case_id)
+
+
+def _clear_current_case_selection(case_id: str) -> None:
+    if st.session_state.get("current_case_id") == case_id:
+        st.session_state.pop("current_case_id", None)
+        st.session_state.pop("current_case_name", None)
+        st.session_state.pop("nav_target", None)
+        if st.session_state.get("workbench_tab") in ("评估分析", "模拟法庭", "评估报告"):
+            st.session_state["workbench_tab"] = "案件列表"
+
+
+def _build_dimension_result(result: dict, fallback: dict, label: str) -> dict:
+    merged = dict(fallback)
+    merged.update(result or {})
+    error = merged.get("error")
+    if error:
+        merged["status"] = "failed"
+        merged["is_complete"] = False
+        merged["analysis"] = f"{label}未完成：{error}"
+    else:
+        merged["status"] = merged.get("status", "completed")
+        merged["is_complete"] = merged.get("status") != "failed"
+    return merged
+
+
+def _build_external_failure(label: str, error: str, status: str = "failed", include_collections: bool = True) -> dict:
+    payload = {
+        "label": label,
+        "status": status,
+        "error": error,
+        "_summary": error,
+    }
+    if include_collections:
+        payload.setdefault("laws", [])
+        payload.setdefault("cases", [])
+    return payload
+
+
+def _safe_external_call(label: str, func, include_collections: bool = True):
+    if _use_mock_mode():
+        return _build_external_failure(label, f"Mock 模式未调用{label}", status="skipped", include_collections=include_collections)
+    try:
+        result = func() or {}
+        if not isinstance(result, dict):
+            raise RuntimeError("返回结果不是字典")
+        result.setdefault("label", label)
+        result.setdefault("status", "completed")
+        result.setdefault("error", None)
+        if include_collections:
+            result.setdefault("laws", [])
+            result.setdefault("cases", [])
+            result.setdefault("_summary", f"{label}已完成")
+        return result
+    except Exception as exc:
+        return _build_external_failure(label, f"{label}失败: {str(exc)[:200]}", include_collections=include_collections)
+
+
+def _collect_retrieval_status(external_results: dict) -> dict:
+    completed = 0
+    total = 0
+    for key in RETRIEVAL_LABELS:
+        total += 1
+        if external_results.get(key, {}).get("status") == "completed":
+            completed += 1
+    if external_results.get("qcc_data", {}).get("status") in ("completed", "not_applicable"):
+        completed += 1
+    total += 1
+    return {"completed": completed, "total": total}
+
+
+def _label_dimension_names(names):
+    return [DIMENSION_LABELS.get(name, name) for name in names]
+
+
+def _build_integrity_payload(integrity: dict) -> dict:
+    critical_issues = _label_dimension_names(integrity.get("critical_missing", [])) + _label_dimension_names(integrity.get("critical_failed", []))
+    optional_issues = _label_dimension_names(integrity.get("optional_incomplete", []))
+    return {
+        "is_complete": integrity.get("is_complete", False),
+        "label": "完整" if integrity.get("is_complete") else "部分完成",
+        "critical_issues": critical_issues,
+        "optional_issues": optional_issues,
+    }
+
+
+def _persist_external_cache(case_id: str, external_results: dict) -> None:
+    save_results(case_id, external_results)
+
+
+def _render_dimension_alert(result: dict, fallback_message: str = ""):
+    status = result.get("status")
+    if status == "failed":
+        accent_notice(result.get("error") or fallback_message or "当前维度未完成")
+    elif status == "skipped":
+        accent_notice(result.get("_summary") or fallback_message)
+
+
+def _render_cached_retrieval(title: str, retrieval: dict, item_kind: str = "mixed", expanded: bool = False):
+    with st.expander(title, expanded=expanded):
+        if not retrieval:
+            accent_notice("暂无缓存检索结果")
+            return
+        status = retrieval.get("status")
+        if status == "failed":
+            accent_notice(retrieval.get("error") or retrieval.get("_summary") or "检索失败")
+            return
+        if status == "skipped":
+            accent_notice(retrieval.get("_summary") or "当前模式未执行外部检索")
+            return
+
+        st.caption(retrieval.get("_summary", "已读取缓存检索结果"))
+        if item_kind in ("mixed", "laws"):
+            for law in retrieval.get("laws", [])[:5]:
+                st.markdown(f"**{law.get('title', '?')}**")
+                if law.get("content"):
+                    st.caption(str(law.get("content"))[:300])
+                if law.get("timeliness"):
+                    st.caption(f"时效: {law.get('timeliness')}")
+        if item_kind in ("mixed", "cases"):
+            for case_item in retrieval.get("cases", [])[:8]:
+                st.markdown(f"**{case_item.get('title', '?')}**")
+                meta = " · ".join([x for x in [case_item.get("court", ""), case_item.get("date", "")] if x])
+                if meta:
+                    st.caption(meta)
+                if case_item.get("summary"):
+                    st.caption(str(case_item.get("summary"))[:200])
+
+
+def _extract_primary_defendant(case_description: str) -> dict:
+    if _use_mock_mode():
+        result = extract_defendant_info(case_description)
+        defendant = (result.get("defendants") or [{}])[0]
+        defendant["status"] = "completed"
+        return defendant
+    try:
+        phase1 = extract_defendant_info(case_description)
+        defendants = phase1.get("defendants", [])
+        if not defendants:
+            return {"status": "failed", "error": "未识别到被告主体"}
+        for item in defendants:
+            if isinstance(item, dict) and item.get("role") == "primary_defendant":
+                item["status"] = "completed"
+                return item
+        first = defendants[0]
+        first["status"] = "completed"
+        return first
+    except Exception as exc:
+        return {"status": "failed", "error": str(exc)[:200]}
+
+
+def _refresh_external_results(case, report_markdown: str = "") -> dict:
+    external_results = {
+        "generated_at": datetime.now().isoformat(),
+        "mode": RUNTIME_CONFIG["mode_label"],
+        "rights_retrieval": _safe_external_call(RETRIEVAL_LABELS["rights_retrieval"], search_for_rights_foundation),
+        "infringement_retrieval": _safe_external_call(RETRIEVAL_LABELS["infringement_retrieval"], search_for_infringement),
+        "procedure_retrieval": _safe_external_call(RETRIEVAL_LABELS["procedure_retrieval"], search_for_procedure),
+        "moot_retrieval": _safe_external_call(RETRIEVAL_LABELS["moot_retrieval"], search_for_moot_court),
+        "financial_retrieval": _safe_external_call(RETRIEVAL_LABELS["financial_retrieval"], search_for_financial),
+        "precedent_retrieval": _safe_external_call(RETRIEVAL_LABELS["precedent_retrieval"], lambda: search_for_precedent(case.case_description)),
+    }
+
+    defendant_info = _extract_primary_defendant(case.case_description)
+    external_results["defendant_info"] = defendant_info
+
+    if _use_mock_mode():
+        external_results["qcc_data"] = _build_external_failure("企查查被告财务画像", "Mock 模式未调用企查查", status="skipped", include_collections=False)
+        external_results["verification"] = _build_external_failure("北大法宝防幻觉验证", "Mock 模式未执行防幻觉验证", status="skipped", include_collections=False)
+        return external_results
+
+    if defendant_info.get("status") == "completed" and defendant_info.get("name"):
+        qcc_data = _safe_external_call(
+            "企查查被告财务画像",
+            lambda: search_for_financial_qcc_full(defendant_info),
+            include_collections=False,
+        )
+    else:
+        qcc_data = {
+            "status": "not_applicable",
+            "error": defendant_info.get("error", "未识别到被告主体名称"),
+            "_summary": "未识别到被告主体名称，未执行企查查检索",
+            "metrics": {},
+            "stages": {},
+        }
+    external_results["qcc_data"] = qcc_data
+
+    if report_markdown:
+        external_results["verification"] = _safe_external_call(
+            "北大法宝防幻觉验证",
+            lambda: run_verification_phase(report_markdown),
+            include_collections=False,
+        )
+        verification = external_results.get("verification", {})
+        for key in ("adjust_provisions", "law_recognition", "anhao_recognition"):
+            if key in verification:
+                external_results[key] = verification.get(key)
+    else:
+        external_results["verification"] = {
+            "status": "not_run",
+            "error": None,
+            "_summary": "尚未执行防幻觉验证",
+            "summary": {},
+        }
+
+    return external_results
+
+
+def _eval_flow_state_key(case_id: str) -> str:
+    return f"eval_flow_state_{case_id}"
+
+
+def _default_eval_flow_state(selected_step: str | None = None) -> dict:
+    return {
+        "running": False,
+        "current_step": None,
+        "completed_steps": [],
+        "selected_step": selected_step,
+    }
+
+
+def _completed_eval_steps(eval_data: dict | None) -> list[str]:
+    if not eval_data:
+        return []
+    completed = []
+    for step in EVAL_FLOW_STEPS:
+        if eval_data.get(step["id"]):
+            completed.append(step["id"])
+    return completed
+
+
+def _ensure_eval_flow_state(case_id: str, eval_data: dict | None = None) -> dict:
+    key = _eval_flow_state_key(case_id)
+    existing = st.session_state.get(key)
+    if existing and existing.get("running"):
+        return existing
+
+    completed = _completed_eval_steps(eval_data)
+    default_selected = completed[-1] if completed else EVAL_FLOW_STEPS[0]["id"]
+    valid_choices = set(completed) or {default_selected}
+    selected = existing.get("selected_step") if existing and existing.get("selected_step") in valid_choices else default_selected
+    state = {
+        "running": False,
+        "current_step": None,
+        "completed_steps": completed,
+        "selected_step": selected,
+    }
+    st.session_state[key] = state
+    return state
+
+
+def _set_eval_flow_state(case_id: str, *, running=None, current_step=None, completed_steps=None, selected_step=None) -> dict:
+    key = _eval_flow_state_key(case_id)
+    state = dict(st.session_state.get(key) or _default_eval_flow_state())
+    if running is not None:
+        state["running"] = running
+    if current_step is not None or running is False:
+        state["current_step"] = current_step
+    if completed_steps is not None:
+        state["completed_steps"] = list(completed_steps)
+    if selected_step is not None:
+        state["selected_step"] = selected_step
+    st.session_state[key] = state
+    return state
+
+
+def _eval_flow_visual_state(step_id: str, flow_state: dict) -> str:
+    completed = set(flow_state.get("completed_steps", []))
+    if flow_state.get("running") and step_id == flow_state.get("current_step"):
+        return "current"
+    if step_id in completed:
+        if step_id == flow_state.get("selected_step"):
+            return "selected"
+        return "complete"
+    return "upcoming"
+
+
+def _eval_flow_group_widths(step_count: int) -> list[float]:
+    grid = [0.76, 0.08, 0.76, 0.08, 0.76, 0.08, 0.76]
+    if step_count == 4:
+        return grid + [2.18]
+    if step_count == 2:
+        return grid + [2.18]
+    if step_count == 1:
+        return grid + [2.18]
+    widths = []
+    for idx in range(step_count):
+        widths.append(0.76)
+        if idx < step_count - 1:
+            widths.append(0.08)
+    widths.append(2.18)
+    return widths
+
+
+
+
+
+
+def _render_eval_flow_card(case_id: str, flow_state: dict, interactive: bool = True, render_token: str = "base") -> None:
+    if flow_state.get("running") and flow_state.get("current_step"):
+        status_text = f"当前进行：{EVAL_FLOW_MAP[flow_state['current_step']]['full_title']}"
+    elif flow_state.get("completed_steps"):
+        status_text = f"已完成 {len(flow_state.get('completed_steps', []))}/{len(EVAL_FLOW_STEPS)} 个环节"
+    else:
+        status_text = "尚未开始评估"
+
+    with st.container(key=f"eval_flow_card_shell_{render_token}"):
+        st.markdown(
+            f"""
+            <div class="eval-flow-header">
+                <div>
+                    <div class="eval-flow-title">评估主流程</div>
+                    <div class="eval-flow-subtitle">点击已完成节点可回看对应评估内容。进行中的节点会以淡橙色呼吸高亮显示。</div>
+                </div>
+                <div class="eval-flow-status">{status_text}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        completed = set(flow_state.get("completed_steps", []))
+        for group_name, step_ids in EVAL_FLOW_GROUPS:
+            st.markdown(f'<div class="eval-flow-group-title">{group_name}</div>', unsafe_allow_html=True)
+            widths = _eval_flow_group_widths(len(step_ids))
+            cols = st.columns(widths)
+            col_idx = 0
+            for idx, step_id in enumerate(step_ids):
+                step_meta = EVAL_FLOW_MAP[step_id]
+                visual_state = _eval_flow_visual_state(step_id, flow_state)
+                with cols[col_idx]:
+                    with st.container(key=f"eval_flow_step_{visual_state}_{case_id}_{step_id}_{render_token}"):
+                        can_click = interactive and step_id in completed
+                        disabled = (not interactive) or visual_state == "upcoming"
+                        if st.button(
+                            step_meta["full_title"],
+                            key=f"eval_flow_btn_{case_id}_{step_id}_{render_token}",
+                            use_container_width=True,
+                            type="primary" if visual_state == "current" else "secondary",
+                            disabled=disabled,
+                        ):
+                            if can_click:
+                                _set_eval_flow_state(
+                                    case_id,
+                                    running=flow_state.get("running"),
+                                    current_step=flow_state.get("current_step"),
+                                    completed_steps=flow_state.get("completed_steps", []),
+                                    selected_step=step_id,
+                                )
+                                st.rerun()
+                col_idx += 1
+                if idx < len(step_ids) - 1:
+                    with cols[col_idx]:
+                        st.markdown('<div class="eval-flow-arrow">→</div>', unsafe_allow_html=True)
+                    col_idx += 1
+
+
+MOOT_ROLE_META = {
+    "judge": {"label": "法官", "role_name": "审判法官"},
+    "plaintiff": {"label": "原告", "role_name": "原告代理律师"},
+    "defendant": {"label": "被告", "role_name": "被告代理律师"},
+}
+
+
+def _moot_round_to_dict(round_result) -> dict:
+    return {
+        "step": round_result.step,
+        "step_name": round_result.step_name,
+        "role": round_result.speaker,
+        "role_name": round_result.role_name,
+        "content": round_result.content,
+    }
+
+
+def _moot_role_type(round_item: dict | None) -> str | None:
+    if not round_item:
+        return None
+    role = str(round_item.get("role", round_item.get("speaker", ""))).lower()
+    role_name = str(round_item.get("role_name", ""))
+    if "judge" in role or "法官" in role_name:
+        return "judge"
+    if "defendant" in role or "被告" in role_name:
+        return "defendant"
+    if "plaintiff" in role or "原告" in role_name:
+        return "plaintiff"
+    return None
+
+
+def _build_moot_round_stub(rounds: list[dict], error: str | None = None) -> dict:
+    return {
+        "rounds": list(rounds),
+        "correction_coefficient": 1.0,
+        "defense_strength": 50,
+        "judge_summary": "",
+        "weak_points": [],
+        "focus_points": [],
+        "judge_scores": {},
+        "error": error,
+    }
+
+
+def _build_moot_status_snapshot(eval_data: dict | None, flow_state: dict) -> dict:
+    moot_r = (eval_data or {}).get("moot") or {}
+    rounds = list(moot_r.get("rounds", []) or [])
+    running_moot = bool(flow_state.get("running") and flow_state.get("current_step") == "moot")
+    active_round = rounds[-1] if rounds else None
+    active_role = _moot_role_type(active_round)
+    all_roles = {_moot_role_type(r) for r in rounds if _moot_role_type(r)}
+    completed_roles = {_moot_role_type(r) for r in (rounds[:-1] if running_moot and rounds else rounds) if _moot_role_type(r)}
+
+    role_states = {}
+    for role_key in ("judge", "plaintiff", "defendant"):
+        if running_moot and role_key == active_role:
+            role_states[role_key] = "current"
+        elif role_key in completed_roles or (not running_moot and role_key in all_roles):
+            role_states[role_key] = "complete"
+        else:
+            role_states[role_key] = "upcoming"
+
+    total_rounds = max(7, len(rounds)) if rounds else 7
+    if running_moot and active_round:
+        status_label = f"进行中 · {len(rounds)}/{total_rounds} 段"
+    elif rounds:
+        status_label = f"已完成 · {len(rounds)}/{total_rounds} 段"
+    elif flow_state.get("running"):
+        status_label = "等待进入 1.4 模拟法庭"
+    else:
+        status_label = "尚未启动"
+
+    stage_name = active_round.get("step_name", "") if active_round else ""
+    speaker_name = active_round.get("role_name", "") if active_round else ""
+    if not stage_name:
+        stage_name = "模拟法庭态势"
+    if not speaker_name:
+        speaker_name = "待启动"
+
+    return {
+        "has_rounds": bool(rounds),
+        "running_moot": running_moot,
+        "status_label": status_label,
+        "stage_name": stage_name,
+        "speaker_name": speaker_name,
+        "completed_count": len(rounds),
+        "total_rounds": total_rounds,
+        "role_states": role_states,
+        "active_round": active_round,
+    }
+
+
+def _render_moot_status_card(case_id: str, eval_data: dict | None, flow_state: dict, render_token: str = "base") -> None:
+    snapshot = _build_moot_status_snapshot(eval_data, flow_state)
+
+    def _role_node_html(role_key: str) -> str:
+        meta = MOOT_ROLE_META[role_key]
+        state = snapshot["role_states"][role_key]
+        note = "当前发言" if state == "current" else "已入场" if state == "complete" else "待发言"
+        return (
+            f'<div class="moot-role-node moot-role-{role_key} moot-state-{state}">'
+            f'<div class="moot-role-name">{meta["label"]}</div>'
+            f'<div class="moot-role-note">{note}</div>'
+            f'</div>'
+        )
+
+    with st.container(key=f"moot_status_card_shell_{render_token}"):
+        st.markdown(
+            f"""
+            <div class="moot-status-header">
+                <div>
+                    <div class="moot-status-title">模拟法庭态势</div>
+                    <div class="moot-status-subtitle">固定脚本式三角色庭审编排。这里展示当前是谁在发言，以及已推进到哪一段。</div>
+                </div>
+                <div class="moot-status-badge">{snapshot["status_label"]}</div>
+            </div>
+            <div class="moot-status-summary">
+                <div class="moot-status-metric"><span class="moot-status-metric-label">当前阶段</span><span class="moot-status-metric-value">{snapshot["stage_name"]}</span></div>
+                <div class="moot-status-metric"><span class="moot-status-metric-label">当前发言</span><span class="moot-status-metric-value">{snapshot["speaker_name"]}</span></div>
+                <div class="moot-status-metric"><span class="moot-status-metric-label">已完成轮次</span><span class="moot-status-metric-value">{snapshot["completed_count"]}/{snapshot["total_rounds"]}</span></div>
+            </div>
+            <div class="moot-triangle-shell">
+                <div class="moot-link moot-link-left"></div>
+                <div class="moot-link moot-link-right"></div>
+                <div class="moot-link moot-link-base"></div>
+                {_role_node_html("judge")}
+                {_role_node_html("plaintiff")}
+                {_role_node_html("defendant")}
+            </div>
+            """
+            ,unsafe_allow_html=True,
+        )
+        st.caption("进入 1.4 模拟法庭后，右侧态势卡会跟随当前轮次更新；完整庭审全文仍保留在独立的「模拟法庭」页中。")
+        if st.button("查看完整模拟法庭 →", key=f"goto_moot_full_{case_id}_{render_token}", use_container_width=True, disabled=not snapshot["has_rounds"]):
+            st.session_state["nav_target"] = "模拟法庭"
+            st.rerun()
+
+
+def _render_eval_moot_live_content(eval_data: dict) -> None:
+    moot_r = eval_data.get("moot") or {}
+    rounds = list(moot_r.get("rounds", []) or [])
+    if not rounds:
+        empty_state_notice("模拟法庭开始后，这里会展示当前轮次的发言内容。")
+        return
+
+    current_round = rounds[-1]
+    role_key = _moot_role_type(current_round) or "plaintiff"
+    role_color = ROLE_COLORS.get(role_key, COLORS["accent"])
+    total_rounds = max(7, len(rounds))
+
+    cols = st.columns(3)
+    cols[0].metric("当前发言", current_round.get("role_name", MOOT_ROLE_META[role_key]["role_name"]))
+    cols[1].metric("当前阶段", current_round.get("step_name", "模拟法庭"))
+    cols[2].metric("已完成轮次", f"{len(rounds)}/{total_rounds}")
+
+    st.markdown(
+        f"""
+        <div style="margin:14px 0 10px 0;padding:12px 14px;border:1px solid {role_color};border-left:4px solid {role_color};background:#fffaf8;">
+            <div style="font-size:0.72rem;color:{role_color};text-transform:uppercase;letter-spacing:0.08em;font-weight:700;margin-bottom:4px;">当前发言内容</div>
+            <div style="font-size:0.85rem;color:#666;">本轮由 {current_round.get("role_name", MOOT_ROLE_META[role_key]["role_name"])} 发言，内容已同步展示在下方。</div>
+        </div>
+        """
+        ,unsafe_allow_html=True,
+    )
+    chat_bubble(
+        current_round.get("role_name", MOOT_ROLE_META[role_key]["role_name"]),
+        current_round.get("step_name", "模拟法庭"),
+        current_round.get("content", ""),
+        role_key,
+    )
+    if len(rounds) > 1:
+        previous_round = rounds[-2]
+        st.caption(f"上一轮：{previous_round.get('role_name', '')} · {previous_round.get('step_name', '')}")
+
+
+def _run_moot_court_with_updates(case_description: str, rights_assessment: str, infringement_assessment: str, evidence_summary: str, on_round=None) -> dict:
+    total_rounds = 7
+    if _use_mock_mode():
+        final_result = mock_llm.run_moot_court_simulation(
+            case_description,
+            rights_assessment=rights_assessment,
+            infringement_assessment=infringement_assessment,
+            evidence_summary=evidence_summary,
+        )
+        rounds = list(final_result.get("rounds", []) or [])
+        if not rounds:
+            return final_result
+        total_rounds = max(total_rounds, len(rounds))
+        for idx in range(len(rounds)):
+            partial = _build_moot_round_stub(rounds[: idx + 1], error=final_result.get("error"))
+            if idx == len(rounds) - 1:
+                partial = dict(final_result)
+                partial["rounds"] = rounds[: idx + 1]
+            if on_round:
+                on_round(partial, idx, total_rounds)
+            time.sleep(0.16)
+        return final_result
+
+    procedure = MootCourtProcedure(
+        case_description=case_description,
+        rights_assessment=rights_assessment,
+        infringement_assessment=infringement_assessment,
+        evidence_summary=evidence_summary,
+    )
+    try:
+        for idx, _ in enumerate(procedure._run_steps()):
+            partial_rounds = [_moot_round_to_dict(r) for r in procedure.rounds]
+            partial = _build_moot_round_stub(partial_rounds)
+            if idx == total_rounds - 1:
+                final_state = MootCourtResult(rounds=list(procedure.rounds))
+                procedure._parse_judge_result(final_state)
+                partial = final_state.to_dict()
+            if on_round:
+                on_round(partial, idx, total_rounds)
+    except RuntimeError as exc:
+        return _build_moot_round_stub([_moot_round_to_dict(r) for r in procedure.rounds], error=str(exc))
+
+    final_state = MootCourtResult(rounds=list(procedure.rounds))
+    procedure._parse_judge_result(final_state)
+    return final_state.to_dict()
+
+
+def _render_eval_rights_content(eval_data: dict) -> None:
+    external_cache = eval_data.get("external_results", {})
+    rights_r = eval_data.get("rights") or {}
+    sub_scores = []
+    for key, value in rights_r.get("sub_scores", {}).items():
+        label = {"validity": "商标有效性", "usage_continuity": "连续使用", "coverage": "覆盖范围", "well_known_status": "驰名地位", "risk_of_invalidation": "无效风险"}.get(key, key)
+        sub_scores.append({"name": label, "score": value, "status": "pass" if value >= 60 else "warning"})
+    dim_card(
+        "1.1 权利基础评估",
+        rights_r.get("score", 0),
+        rights_r.get("analysis", ""),
+        sub_items=sub_scores,
+        extra="优势: " + ", ".join(rights_r.get("strengths", ["-"])) + "\n\n风险: " + ", ".join(rights_r.get("risks", ["-"])),
+    )
+    _render_dimension_alert(rights_r)
+    _render_cached_retrieval("北大法宝 · 法条检索（缓存）", external_cache.get("rights_retrieval", {}), "laws", True)
+
+
+def _render_eval_infringement_content(eval_data: dict) -> None:
+    external_cache = eval_data.get("external_results", {})
+    infr_r = eval_data.get("infringement") or {}
+    el_items = [{"name": el.get("name", "未知要素"), "score": el.get("score", 0), "status": el.get("status", "pass"), "detail": el.get("analysis", "")} for el in infr_r.get("elements", [])]
+    dim_card("1.2 侵权认定评估", infr_r.get("score", 0), infr_r.get("analysis", ""), sub_items=el_items)
+    _render_dimension_alert(infr_r)
+    _render_cached_retrieval("北大法宝 · 类案检索（缓存）", external_cache.get("infringement_retrieval", {}), "mixed", True)
+
+
+def _render_eval_procedure_content(eval_data: dict) -> None:
+    external_cache = eval_data.get("external_results", {})
+    proc_r = eval_data.get("procedure") or {}
+    proc_items = [{"name": item.get("name", "未知程序项"), "status": item.get("status", "pass"), "detail": item.get("detail", "")} for item in proc_r.get("items", [])]
+    dim_card("1.3 诉讼程序审查", proc_r.get("score", 0), proc_r.get("analysis", ""), sub_items=proc_items)
+    _render_dimension_alert(proc_r)
+    _render_cached_retrieval("北大法宝 · 法条检索（缓存）", external_cache.get("procedure_retrieval", {}), "laws", True)
+
+
+def _render_eval_moot_content(eval_data: dict) -> None:
+    external_cache = eval_data.get("external_results", {})
+    moot_r = eval_data.get("moot") or {}
+    coeff = eval_data.get("correction_coeff", 1.0)
+    if moot_r.get("status") == "failed" and not moot_r.get("rounds"):
+        accent_notice(moot_r.get("error", "模拟法庭未完成"))
+    else:
+        defense_strength = moot_r.get("defense_strength", 50)
+        coeff_color = COLORS["danger"] if coeff < 0.9 else COLORS["warning"] if coeff < 1.0 else COLORS["success"]
+        col_c1, col_c2 = st.columns(2)
+        with col_c1:
+            metric_card("对抗修正系数", f"{coeff:.2f}", "中性=1.0", coeff_color)
+        with col_c2:
+            metric_card("被告抗辩强度", f"{defense_strength}/100", "用于理解对抗压力", COLORS["warning"])
+
+        focus_points = moot_r.get("focus_points", [])
+        if focus_points:
+            st.markdown(
+                f"""
+                <div class="card" style="border-left:4px solid {COLORS['accent']};">
+                    <div style="font-weight:700;color:{COLORS['text_dark']};margin-bottom:10px;text-transform:uppercase;letter-spacing:0.05em;font-size:0.85rem;">争议焦点</div>
+                    {''.join(f'<div style="font-size:0.85rem;color:#333;margin-bottom:6px;">{i+1}. {fp}</div>' for i, fp in enumerate(focus_points))}
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+        rounds = moot_r.get("rounds", [])
+        if rounds:
+            st.markdown(
+                f"""
+                <div style="font-size:1.1rem;font-weight:800;color:{COLORS['text_dark']};margin-bottom:12px;letter-spacing:-0.02em;">
+                    庭审记录（共{len(rounds)}轮发言）
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            for rnd in rounds:
+                role_name = rnd.get("role_name", rnd.get("role", rnd.get("speaker", "")))
+                step_name = rnd.get("step_name", "")
+                content = rnd.get("content", "")
+                role_type = _moot_role_type(rnd) or "plaintiff"
+                chat_bubble(role_name, step_name, content, role_type)
+
+        weak_points = moot_r.get("weak_points", [])
+        if weak_points:
+            st.markdown(
+                f"""
+                <div class="card" style="border-left:4px solid {COLORS['danger']};">
+                    <div style="font-weight:700;color:{COLORS['text_dark']};margin-bottom:10px;text-transform:uppercase;letter-spacing:0.05em;font-size:0.85rem;">对抗暴露的薄弱环节</div>
+                    {''.join(f'<div style="font-size:0.85rem;color:#333;margin-bottom:6px;">- {wp}</div>' for wp in weak_points)}
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+    _render_cached_retrieval("北大法宝 · 抗辩模式类案（缓存）", external_cache.get("moot_retrieval", {}), "cases", True)
+
+
+def _render_eval_financial_content(eval_data: dict) -> None:
+    external_cache = eval_data.get("external_results", {})
+    fin_r = eval_data.get("financial") or {}
+    qcc_d = eval_data.get("qcc_data", {})
+    fin_score = fin_r.get("score", 0)
+    de = fin_r.get("damages_estimate", {})
+    te = fin_r.get("time_estimate", {})
+    fin_extra = []
+    if de:
+        fin_extra.append(f"判赔预测: P10=¥{de.get('p10', '-')} / P50=¥{de.get('p50', '-')} / P90=¥{de.get('p90', '-')}" )
+    fin_extra.append(f"预估成本: ¥{fin_r.get('cost_estimate', '-')}" )
+    if te:
+        fin_extra.append(f"时间: 一审{te.get('first_instance_months', '-')}月 + 二审{te.get('second_instance_months', '-')}月 + 执行{te.get('enforcement_months', '-')}月")
+    fin_extra.append(f"回款概率: {fin_r.get('recovery_probability', '-')}%")
+    dim_card("2.1 财务回报评估", fin_score, fin_r.get("analysis", ""), extra="\n".join(fin_extra))
+    _render_dimension_alert(fin_r)
+
+    if qcc_d.get("status") == "completed" and qcc_d.get("stages"):
+        with st.expander("企查查 · 被告财务画像（缓存）", expanded=False):
+            st.caption(qcc_d.get("_summary", ""))
+            metrics = qcc_d.get("metrics", {})
+            if metrics:
+                cols = st.columns(3)
+                cols[0].metric("回款概率", f"{metrics.get('recovery_probability', '-')}%")
+                cols[1].metric("判赔方向", metrics.get('damages_adjustment', '-'))
+                cols[2].metric("时间延长", f"+{metrics.get('time_extra_months', 0)}月")
+    elif qcc_d.get("_summary"):
+        accent_notice(qcc_d.get("_summary"))
+
+    _render_cached_retrieval("北大法宝 · 判赔数据类案（缓存）", external_cache.get("financial_retrieval", {}), "cases", True)
+
+
+def _render_eval_precedent_content(eval_data: dict, goal_type: str) -> None:
+    external_cache = eval_data.get("external_results", {})
+    prec_r = eval_data.get("precedent") or {}
+    fin_r = eval_data.get("financial") or {}
+    biz_s = eval_data.get("business_score", 0)
+    dim_card("2.2 判例价值评估", prec_r.get("score", 0), prec_r.get("analysis", ""), extra=f"首案指数: {prec_r.get('first_case_index', '-')} | 影响力级别: {prec_r.get('influence_level', '-')}")
+    _render_dimension_alert(prec_r)
+    _render_cached_retrieval("北大法宝 · 首案检索（缓存）", external_cache.get("precedent_retrieval", {}), "cases", True)
+    accent_notice(f"维度二 业务预期综合得分: {biz_s} 分")
+    if goal_type == "要钱":
+        st.caption(f"公式: 0.9×财务({fin_r.get('score', 0)}) + 0.1×判例({prec_r.get('score', 0)}) = {biz_s}")
+    else:
+        st.caption(f"公式: 0.1×财务({fin_r.get('score', 0)}) + 0.9×判例({prec_r.get('score', 0)}) = {biz_s}")
+
+
+def _render_eval_evidence_content(eval_data: dict) -> None:
+    evid_r = eval_data.get("evidence") or {}
+    evid_s = eval_data.get("evidence_score", 0)
+    ev_items = [{"name": item.get("requirement", "未知证据项"), "status": item.get("status", "不足"), "detail": item.get("analysis", "")} for item in evid_r.get("evidence_matrix", [])]
+    dim_card(
+        "证据就绪度评估",
+        evid_r.get("score", 0),
+        evid_r.get("analysis", ""),
+        sub_items=ev_items,
+        extra="补证建议: " + ("; ".join(evid_r.get("remediation_suggestions", ["无"]))) + "\n\n取证技术建议: " + evid_r.get("collection_advice", "根据证据类型自行判断"),
+    )
+    _render_dimension_alert(evid_r)
+    if evid_r.get("status") == "failed":
+        accent_notice("证据维度未完成，系统不会输出完整综合建议。")
+    else:
+        accent_notice(f"维度三 证据就绪度得分: {evid_s} 分")
+
+def _render_eval_compact_summary(eval_data: dict, case_id: str, render_token: str = "base") -> None:
+    integrity_info = eval_data.get("integrity", {"is_complete": True, "label": "完整", "critical_issues": []})
+    rec_data = eval_data.get("recommendation", {})
+    final_s = eval_data.get("final_score")
+
+    with st.container(key=f"eval_result_card_shell_{render_token}"):
+        st.markdown(
+            """
+            <div class="eval-result-header">
+                <div>
+                    <div class="eval-result-title">最终结果</div>
+                    <div class="eval-result-subtitle">展示当前案件的三维得分、综合建议与结果校验状态。</div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        cols = st.columns(4)
+        cols[0].metric("法律可行性", eval_data.get("legal_score", 0))
+        cols[1].metric("业务预期", eval_data.get("business_score", 0))
+        cols[2].metric("证据就绪度", eval_data.get("evidence_score", 0))
+        cols[3].metric("综合分", "未生成" if final_s is None else final_s)
+        st.caption(f"综合建议：{rec_data.get('recommendation', '待评估')} · 数据完整性：{integrity_info.get('label', '未知')} · 置信度：{eval_data.get('confidence_score', 0)}%")
+        if integrity_info.get("critical_issues"):
+            accent_notice("关键未完成项：" + "、".join(integrity_info.get("critical_issues", [])))
+        if eval_data.get("external_results", {}).get("generated_at"):
+            st.caption(f"结果页默认展示缓存数据，最近缓存时间：{eval_data['external_results']['generated_at']}")
+        if not _use_mock_mode():
+            valid_status = get_validation_status(case_id)
+            st.caption(
+                f"法条验证：{'通过' if valid_status.get('provisions_validated') else '待验证'} · "
+                f"法规识别：{'通过' if valid_status.get('laws_validated') else '待验证'} · "
+                f"案号识别：{'通过' if valid_status.get('cases_validated') else '待验证'}"
+            )
+
+
+def _render_eval_detail_card(case_id: str, case, eval_data: dict | None, flow_state: dict, pending_message: str | None = None, render_token: str = "base") -> None:
+    selected_step = flow_state.get("current_step") if flow_state.get("running") and flow_state.get("current_step") else flow_state.get("selected_step")
+    selected_step = selected_step or EVAL_FLOW_STEPS[0]["id"]
+    step_meta = EVAL_FLOW_MAP[selected_step]
+    tag_label = "当前进行" if flow_state.get("running") and selected_step == flow_state.get("current_step") else "当前展示"
+
+    with st.container(key=f"eval_detail_card_shell_{render_token}"):
+        st.markdown(
+            f"""
+            <div class="eval-detail-header">
+                <div>
+                    <div class="eval-detail-title">{step_meta['full_title']}</div>
+                    <div class="eval-detail-subtitle">{step_meta['source']}</div>
+                </div>
+                <div class="eval-detail-tag">{tag_label}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        if pending_message:
+            accent_notice(pending_message)
+
+        if not eval_data or not eval_data.get(selected_step):
+            empty_state_notice("开始评估后，这里会展示当前环节的详细分析内容。评估完成后，可点击上方已完成节点回看。")
+            return
+
+        if selected_step == "rights":
+            _render_eval_rights_content(eval_data)
+        elif selected_step == "infringement":
+            _render_eval_infringement_content(eval_data)
+        elif selected_step == "procedure":
+            _render_eval_procedure_content(eval_data)
+        elif selected_step == "moot":
+            if flow_state.get("running") and selected_step == flow_state.get("current_step"):
+                _render_eval_moot_live_content(eval_data)
+            else:
+                _render_eval_moot_content(eval_data)
+        elif selected_step == "financial":
+            _render_eval_financial_content(eval_data)
+        elif selected_step == "precedent":
+            _render_eval_precedent_content(eval_data, case.goal_type if case else "要钱")
+        elif selected_step == "evidence":
+            _render_eval_evidence_content(eval_data)
 
 
 # ============================================================
@@ -153,39 +1120,109 @@ def render_radar_html(scores: dict, size: int = 340) -> str:
 # 侧边栏
 # ============================================================
 
-# 页面定义
-page_options = ["新建案件", "案件列表", "评估分析", "模拟法庭", "评估报告", "关于"]
+TOP_LEVEL_PAGES = ["工作台", "系统配置", "关于"]
+WORKBENCH_PAGES = ["案件列表", "新建案件", "评估分析", "模拟法庭", "评估报告"]
+WORKBENCH_PROGRESS = {"新建案件": 1, "案件列表": 2, "评估分析": 3, "模拟法庭": 4, "评估报告": 5}
 
-if "nav_page" not in st.session_state:
-    st.session_state.nav_page = "新建案件"
 
+def _build_workbench_summary() -> dict:
+    active_tab = st.session_state.get("workbench_tab", WORKBENCH_PAGES[0])
+    current_case_name = st.session_state.get("current_case_name", "尚未选择案件")
+    if "current_case_id" in st.session_state:
+        case_hint = f"当前案件 ID: {st.session_state['current_case_id']}"
+    else:
+        case_hint = "先新建案件，或从案件列表中选择一个继续。"
+
+    progress_value = WORKBENCH_PROGRESS.get(active_tab, 1)
+    progress_hint = f"工作台当前停留在「{active_tab}」"
+    if active_tab == "评估分析":
+        progress_hint = "工作台当前聚焦核心评估结果"
+    elif active_tab == "模拟法庭":
+        progress_hint = "工作台当前聚焦对抗检验"
+    elif active_tab == "评估报告":
+        progress_hint = "工作台当前聚焦结论与下载输出"
+
+    return {
+        "active_tab": active_tab,
+        "current_case_name": current_case_name,
+        "case_hint": case_hint,
+        "progress_text": f"{progress_value}/{len(WORKBENCH_PAGES)}",
+        "progress_hint": progress_hint,
+    }
+
+
+def _activate_workbench_tab(target: str) -> None:
+    st.session_state["page"] = "工作台"
+    st.session_state["workbench_tab"] = target
+
+
+def render_workbench_tab_row() -> None:
+    active_tab = st.session_state.get("workbench_tab", WORKBENCH_PAGES[0])
+    container_key = "workbench_tabs_main"
+    with st.container(
+        key=container_key,
+        horizontal=True,
+        horizontal_alignment="distribute",
+        gap=None,
+    ):
+        for tab_name in WORKBENCH_PAGES:
+            if st.button(
+                tab_name,
+                key=f"{container_key}_{tab_name}",
+                type="primary" if tab_name == active_tab else "secondary",
+                use_container_width=True,
+            ):
+                _activate_workbench_tab(tab_name)
+                st.rerun()
+
+
+def render_workbench_shell() -> None:
+    summary = _build_workbench_summary()
+    st.markdown(f"""
+    <div class="workbench-hero workbench-hero-compact">
+        <div class="workbench-stat-card compact">
+            <div class="workbench-stat-label">当前案件</div>
+            <div class="workbench-stat-value current-case">{summary['current_case_name']}</div>
+            <div class="workbench-stat-sub">{summary['case_hint']}</div>
+        </div>
+        <div class="workbench-stat-card compact">
+            <div class="workbench-stat-label">流程位置</div>
+            <div class="workbench-stat-value progress-value">{summary['progress_text']}</div>
+            <div class="workbench-stat-sub">当前停留在「{summary['active_tab']}」 · {summary['progress_hint']}</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+    render_workbench_tab_row()
+    st.markdown("<div class='workbench-shell-gap'></div>", unsafe_allow_html=True)
+
+
+if "page" not in st.session_state:
+    st.session_state["page"] = "工作台"
+if "workbench_tab" not in st.session_state:
+    st.session_state["workbench_tab"] = "新建案件"
 if st.session_state.get("nav_target"):
     target = st.session_state.pop("nav_target")
-    if target in page_options:
-        st.session_state.nav_page = target
+    if target in WORKBENCH_PAGES:
+        _activate_workbench_tab(target)
+    elif target in TOP_LEVEL_PAGES:
+        st.session_state["page"] = target
     st.rerun()
 
 # 侧边栏品牌区
 st.sidebar.markdown("""
-<div style="padding:8px 0 16px 0;">
-    <div style="font-size:1.5rem;font-weight:800;color:#ffffff;letter-spacing:-0.03em;line-height:1;">
+<div style="padding:12px 8px 18px 8px;">
+    <div style="font-size:1.8rem;font-weight:800;color:#ffffff;letter-spacing:-0.04em;line-height:1;">
         诉算
     </div>
-    <div style="font-size:0.7rem;color:#cce8eb;margin-top:4px;letter-spacing:0.05em;">
-        SOFT IP LITIGATION EVAL
+    <div style="font-size:0.72rem;color:rgba(255,255,255,0.68);margin-top:6px;letter-spacing:0.12em;text-transform:uppercase;">
+        Soft IP Litigation Eval
     </div>
 </div>
 """, unsafe_allow_html=True)
 
 st.sidebar.divider()
 
-# ── 自定义滑块导航（替代 st.radio 避免圆点）──
-if "page" not in st.session_state:
-    st.session_state["page"] = "新建案件"
-# 关键：所有项（无论是否激活）都用 st.sidebar.button 渲染
-# 激活项通过 disabled=True 标记；外层容器统一是 stButton → 尺寸天然一致
-# 激活态用 button:disabled CSS 选择器单独定义左侧滑块 + 浅橙背景 + 纯白文字
-for opt in page_options:
+for opt in TOP_LEVEL_PAGES:
     is_active = st.session_state["page"] == opt
     if st.sidebar.button(
         opt,
@@ -196,32 +1233,28 @@ for opt in page_options:
         st.session_state["page"] = opt
         st.rerun()
 
-# 侧边栏导航按钮样式：所有项共享一套尺寸，仅 disabled 状态切换视觉
+# 侧边栏导航按钮样式：仅保留两级入口，强化当前选中项
 st.sidebar.markdown("""
 <style>
-/* 容器：去掉 stButton 默认外边距，保证与未激活项 1:1 对齐 */
 section[data-testid="stSidebar"] div[data-testid="stButton"] {
     margin: 0 !important;
     padding: 0 !important;
 }
-
-/* 基础样式：所有导航按钮共享的 padding / 高度 / 圆角 / 左边框 */
 section[data-testid="stSidebar"] button[kind="secondary"] {
     background: transparent !important;
     border: none !important;
-    border-left: 3px solid transparent !important;
     box-shadow: none !important;
     text-align: left !important;
     justify-content: flex-start !important;
     align-items: center !important;
-    padding: 12px 16px !important;
-    font-size: 0.9rem !important;
-    font-weight: 400 !important;
-    color: #cfd5e0 !important;
-    border-radius: 0 4px 4px 0 !important;
-    transition: all 0.2s ease !important;
+    padding: 14px 16px !important;
+    font-size: 0.95rem !important;
+    font-weight: 500 !important;
+    color: rgba(255,255,255,0.76) !important;
+    border-radius: 14px !important;
+    transition: all 0.18s ease !important;
     width: 100% !important;
-    min-height: 40px !important;
+    min-height: 46px !important;
     line-height: 1.2 !important;
     box-sizing: border-box !important;
 }
@@ -230,46 +1263,32 @@ section[data-testid="stSidebar"] button[kind="secondary"] div {
     text-align: left !important;
     justify-content: flex-start !important;
     width: 100% !important;
-    font-weight: 400 !important;
     line-height: 1.2 !important;
     color: inherit !important;
 }
-
-/* 未激活：hover 提示（仅作用于非 disabled） */
 section[data-testid="stSidebar"] button[kind="secondary"]:not(:disabled):hover {
-    background: rgba(255,255,255,0.05) !important;
-    border-left-color: rgba(214,89,56,0.4) !important;
+    background: rgba(255,255,255,0.08) !important;
+    color: #ffffff !important;
 }
-section[data-testid="stSidebar"] button[kind="secondary"]:not(:disabled):focus:not(:active) {
-    background: transparent !important;
-    border-color: transparent !important;
-    box-shadow: none !important;
-    color: #cfd5e0 !important;
-}
-
-/* 激活态：disabled 按钮 — 橙色滑块 + 浅橙背景 + 纯白文字 */
 section[data-testid="stSidebar"] button[kind="secondary"]:disabled {
     background: rgba(214,89,56,0.12) !important;
-    border-left: 3px solid #d65938 !important;
     color: #ffffff !important;
     cursor: default !important;
     opacity: 1 !important;
-}
-section[data-testid="stSidebar"] button[kind="secondary"]:disabled:hover {
-    background: rgba(214,89,56,0.12) !important;
-    border-left: 3px solid #d65938 !important;
-    color: #ffffff !important;
+    box-shadow: inset 3px 0 0 #d65938 !important;
 }
 section[data-testid="stSidebar"] button[kind="secondary"]:disabled p,
 section[data-testid="stSidebar"] button[kind="secondary"]:disabled div {
     color: #ffffff !important;
-    font-weight: 400 !important;
     opacity: 1 !important;
 }
 </style>
 """, unsafe_allow_html=True)
 
-page = st.session_state["page"]
+top_level_page = st.session_state["page"]
+if top_level_page == "工作台":
+    render_workbench_shell()
+page = st.session_state.get("workbench_tab", WORKBENCH_PAGES[0]) if top_level_page == "工作台" else top_level_page
 
 # 当前案件上下文
 if "current_case_id" in st.session_state:
@@ -292,8 +1311,8 @@ if "current_case_id" in st.session_state:
 
 # 底部信息
 st.sidebar.divider()
-mode_label = "Mock 模拟模式" if USE_MOCK else "DeepSeek API 模式"
-mode_color = "#d65938" if USE_MOCK else "#a5d8dd"
+mode_label = RUNTIME_CONFIG["mode_label"]
+mode_color = "#d65938" if RUNTIME_CONFIG["use_mock"] else "#a5d8dd"
 st.sidebar.markdown(f"""
 <div style="font-size:0.72rem;color:#cce8eb;opacity:0.7;">
     <span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:{mode_color};margin-right:6px;"></span>
@@ -303,6 +1322,22 @@ st.sidebar.markdown(f"""
     v{APP_VERSION} · © 2026 诉算
 </div>
 """, unsafe_allow_html=True)
+
+if RUNTIME_CONFIG["missing_required"]:
+    st.sidebar.markdown(
+        f'<div style="margin:10px 0;padding:10px 12px;border:1px solid #d65938;background:#fbe8e3;color:#0d1429;font-size:0.82rem;line-height:1.6;">真实 Demo 模式缺少配置：{"、".join(RUNTIME_CONFIG["missing_required"])}。</div>',
+        unsafe_allow_html=True,
+    )
+for warning in RUNTIME_CONFIG["optional_warnings"]:
+    st.sidebar.markdown(
+        f'<div style="margin:10px 0;padding:10px 12px;border:1px solid #d65938;background:#fbe8e3;color:#0d1429;font-size:0.82rem;line-height:1.6;">{warning}</div>',
+        unsafe_allow_html=True,
+    )
+if RUNTIME_CONFIG.get("storage_notice"):
+    st.sidebar.markdown(
+        f'<div style="margin:10px 0;padding:10px 12px;border:1px solid #d65938;background:#fbe8e3;color:#0d1429;font-size:0.82rem;line-height:1.6;">{RUNTIME_CONFIG["storage_notice"]}</div>',
+        unsafe_allow_html=True,
+    )
 
 
 # ============================================================
@@ -331,7 +1366,7 @@ if page == "新建案件":
             client_org = st.text_input("委托客户", placeholder="例如：某知名品牌公司")
             goal_type = st.radio("业务目标", ["要钱", "要名"], horizontal=True)
 
-            submitted = st.form_submit_button("创建案件并开始评估", type="primary", use_container_width=True)
+            submitted = st.form_submit_button("创建案件并进入评估", type="primary", use_container_width=True)
 
             if submitted:
                 full_desc = case_description.strip()
@@ -343,7 +1378,7 @@ if page == "新建案件":
                         new_case = Case(
                             name=case_name, cause_type="商标侵权",
                             goal_type=goal_type, client_org=client_org or "",
-                            case_description=full_desc, status="draft"
+                            case_description=full_desc, status="pending"
                         )
                         db.add(new_case)
                         db.commit()
@@ -402,11 +1437,11 @@ if page == "新建案件":
                         st.session_state["evidence_text_extra"] = current_extra + f"\n\n【证据文件: {fname}】\n{result['text']}"
                         st.rerun()
             else:
-                st.warning(f"{fname}: {result['error']}")
+                accent_notice(f"{fname}: {result['error']}")
 
         evidence_extra_show = st.session_state.get("evidence_text_extra", "")
         if evidence_extra_show:
-            st.success(f"已追加 {len(evidence_extra_show)} 字证据文本到案情描述")
+            accent_notice(f"已追加 {len(evidence_extra_show)} 字证据文本到案情描述")
             if st.button("清除已追加的证据文本", type="secondary"):
                 st.session_state["evidence_text_extra"] = ""
                 st.rerun()
@@ -418,37 +1453,72 @@ if page == "新建案件":
 elif page == "案件列表":
     page_header("案件列表", "查看和管理所有评估案件")
 
-    db = SessionLocal()
-    try:
-        cases = db.query(Case).order_by(Case.created_at.desc()).all()
-        if not cases:
-            st.info("暂无案件，请先创建案件")
-        else:
-            # 预取所有评分
+    def _load_case_list():
+        db = SessionLocal()
+        try:
+            cases = db.query(Case).order_by(Case.created_at.desc()).all()
             case_data = []
             for c in cases:
                 score = db.query(ScoreSnapshot).filter(
                     ScoreSnapshot.case_id == c.id
                 ).order_by(ScoreSnapshot.id.desc()).first()
                 case_data.append((c, score))
+            return case_data
+        finally:
+            db.close()
 
-            # 两列网格布局
-            for i in range(0, len(case_data), 2):
-                cols = st.columns(2)
-                for j in range(2):
-                    if i + j < len(case_data):
-                        c, score = case_data[i + j]
-                        with cols[j]:
-                            case_card(c.id, c.name, c.cause_type, c.goal_type, c.status,
-                                     score.final_score if score else None,
-                                     score.recommendation if score else None)
-                            if st.button("查看 →", key=f"v_{c.id}", use_container_width=True):
-                                st.session_state["current_case_id"] = c.id
-                                st.session_state["current_case_name"] = c.name
-                                st.session_state["nav_target"] = "评估分析"
-                                st.rerun()
-    finally:
-        db.close()
+    try:
+        case_data = _load_case_list()
+    except OperationalError:
+        init_db()
+        try:
+            case_data = _load_case_list()
+        except OperationalError:
+            st.error("案件数据库暂未就绪，请稍后刷新页面重试。")
+            accent_notice("如果问题持续存在，我可以继续帮你检查本地数据库连接。")
+            st.stop()
+
+    delete_notice = st.session_state.pop("case_delete_notice", None)
+    if delete_notice:
+        accent_notice(delete_notice)
+
+    if not case_data:
+        empty_state_notice("暂无案件，请先创建案件")
+    else:
+        # 两列网格布局
+        for i in range(0, len(case_data), 2):
+            cols = st.columns(2)
+            for j in range(2):
+                if i + j < len(case_data):
+                    c, score = case_data[i + j]
+                    with cols[j]:
+                        case_card(c.id, c.name, c.cause_type, c.goal_type, c.status,
+                                 score.final_score if score else None,
+                                 score.recommendation if score else None)
+                        action_cols = st.columns(2, gap="small")
+                        if action_cols[0].button("删除", key=f"d_{c.id}", use_container_width=True, help="删除后会同时清空该案件的评估结果与报告"):
+                            db = SessionLocal()
+                            try:
+                                target_case = db.query(Case).filter(Case.id == c.id).first()
+                                if not target_case:
+                                    st.error("案件不存在或已删除")
+                                else:
+                                    _reset_case_outputs(db, c.id)
+                                    db.delete(target_case)
+                                    db.commit()
+                                    _clear_current_case_selection(c.id)
+                                    st.session_state["case_delete_notice"] = f"案件“{c.name}”已删除。"
+                                    st.rerun()
+                            except Exception as e:
+                                db.rollback()
+                                st.error(f"删除失败: {e}")
+                            finally:
+                                db.close()
+                        if action_cols[1].button("查看 →", key=f"v_{c.id}", use_container_width=True):
+                            st.session_state["current_case_id"] = c.id
+                            st.session_state["current_case_name"] = c.name
+                            st.session_state["nav_target"] = "评估分析"
+                            st.rerun()
 
 
 # ============================================================
@@ -458,7 +1528,13 @@ elif page == "评估分析":
     page_header("诉前评估分析", "三维乘法评分模型 · 法律可行性 × 业务预期 × 证据就绪度")
 
     if "current_case_id" not in st.session_state:
-        st.warning("请先在「案件列表」中选择一个案件，或在「新建案件」中创建案件")
+        preview_state = _default_eval_flow_state(selected_step=EVAL_FLOW_STEPS[0]["id"])
+        preview_cols = st.columns([1.7, 1.0], gap="medium")
+        with preview_cols[0]:
+            _render_eval_flow_card("preview", preview_state, interactive=False, render_token="preview")
+        with preview_cols[1]:
+            _render_moot_status_card("preview", None, preview_state, render_token="preview")
+        _render_eval_detail_card("preview", None, None, preview_state, render_token="preview")
         st.stop()
 
     case_id = st.session_state["current_case_id"]
@@ -471,54 +1547,175 @@ elif page == "评估分析":
             st.error("案件不存在")
             st.stop()
 
-        # ── 案件信息卡片 ──
-        status_map = {"draft": "草稿", "evaluating": "评估中", "completed": "已完成"}
-        status_text = status_map.get(case.status, "未知")
-        status_colors = {"draft": COLORS["text_muted"], "evaluating": COLORS["warning"], "completed": COLORS["accent"]}
-        st_color = status_colors.get(case.status, COLORS["text_muted"])
+        eval_key = f"eval_results_{case_id}"
+        eval_data = st.session_state.get(eval_key) or _load_eval_cache(case_id)
+        if eval_data and eval_key not in st.session_state:
+            st.session_state[eval_key] = eval_data
 
-        st.html(f"""
-        <div class="card" style="border-left:4px solid {COLORS['primary']};">
-            <div style="display:flex;justify-content:space-between;align-items:center;">
-                <div>
-                    <div style="font-size:1.1rem;font-weight:700;color:{COLORS['text_dark']};letter-spacing:-0.01em;">{case_name}</div>
-                    <div style="font-size:0.78rem;color:{COLORS['text_muted']};margin-top:4px;">
-                        ID: {case_id} &nbsp;|&nbsp; 案由: {case.cause_type} &nbsp;|&nbsp; 目标: {case.goal_type}
-                        {f' &nbsp;|&nbsp; 客户: {case.client_org}' if case.client_org else ''}
+
+        # ���� ������Ϣ������Ƭ ����
+        status_text = _case_status_label(case.status)
+        st_color = _case_status_text_color(case.status)
+        notice_key = f"case_update_notice_{case_id}"
+        edit_toggle_key = f"editing_case_{case_id}"
+
+        with st.container(key=f"eval_case_panel_{case_id}"):
+            st.markdown(
+                f"""
+                <div class="eval-case-summary">
+                    <div class="eval-case-summary-main">
+                        <div class="eval-case-summary-title">{case_name}</div>
+                        <div class="eval-case-summary-meta">
+                            ID: {case_id} &nbsp;|&nbsp; 案由: {case.cause_type} &nbsp;|&nbsp; 目标: {case.goal_type}
+                            {f' &nbsp;|&nbsp; 客户: {case.client_org}' if case.client_org else ''}
+                        </div>
+                    </div>
+                    <div class="eval-case-summary-status">
+                        <span class="status-badge" style="background:{'#ffffff'};color:{st_color};border-color:{st_color};">{status_text}</span>
                     </div>
                 </div>
-                <div>
-                    <span class="status-badge" style="background:{'#ffffff'};color:{st_color};border-color:{st_color};">{status_text}</span>
-                </div>
-            </div>
-        </div>
-        """)
+                """,
+                unsafe_allow_html=True,
+            )
 
-        with st.expander("查看案情描述", expanded=True):
-            st.markdown(case.case_description)
+            notice_message = st.session_state.pop(notice_key, None)
+            if notice_message:
+                accent_notice(notice_message)
 
-        # ── 检查评估结果是否已在 session state ──
-        eval_key = f"eval_results_{case_id}"
-        eval_data = st.session_state.get(eval_key)
+            col_edit_action, col_edit_note = st.columns([0.9, 2.1], vertical_alignment="center")
+            with col_edit_action:
+                edit_label = "关闭编辑" if st.session_state.get(edit_toggle_key, False) else "编辑案件信息"
+                if st.button(edit_label, key=f"toggle_edit_case_{case_id}", use_container_width=True):
+                    st.session_state[edit_toggle_key] = not st.session_state.get(edit_toggle_key, False)
+                    st.rerun()
+            with col_edit_note:
+                st.markdown(
+                    '<div class="eval-case-edit-note">修改案件名称、业务目标或案情描述后，系统会自动清空旧评估结果并将案件状态重置为待评估。</div>',
+                    unsafe_allow_html=True,
+                )
 
-        # 已完成案件但 session state 无结果 → 从 DB 显示摘要
-        if case.status == "completed" and not eval_data:
-            latest = db.query(ScoreSnapshot).filter(ScoreSnapshot.case_id == case_id).order_by(ScoreSnapshot.id.desc()).first()
-            if latest:
-                col_m1, col_m2, col_m3 = st.columns(3)
-                with col_m1:
-                    metric_card("综合得分", f"{latest.final_score}", "分")
-                with col_m2:
-                    metric_card("置信度", f"{latest.confidence_score}%", "")
-                with col_m3:
-                    metric_card("建议", latest.recommendation, "", COLORS["primary"])
-                st.markdown("")
+            if st.session_state.get(edit_toggle_key, False):
+                with st.form(f"edit_case_form_{case_id}"):
+                    edited_name = st.text_input("案件名称 *", value=case.name or "")
+                    edited_client_org = st.text_input("委托客户", value=case.client_org or "")
+                    goal_options = ["要钱", "要名"]
+                    goal_index = goal_options.index(case.goal_type) if case.goal_type in goal_options else 0
+                    edited_goal_type = st.radio("业务目标", goal_options, index=goal_index, horizontal=True)
+                    edited_description = st.text_area("案情描述 *", value=case.case_description or "", height=180)
 
-        # ── 评估按钮 ──
-        col_sp1, col_btn, col_sp2 = st.columns([1, 2, 1])
-        with col_btn:
-            btn_label = "重新评估" if eval_data else "开始评估"
-            do_eval = st.button(btn_label, type="primary", use_container_width=True)
+                    col_save, col_cancel = st.columns(2)
+                    save_edit = col_save.form_submit_button("保存修改", type="primary", use_container_width=True)
+                    cancel_edit = col_cancel.form_submit_button("取消", use_container_width=True)
+
+                    if cancel_edit:
+                        st.session_state[edit_toggle_key] = False
+                        st.rerun()
+
+                    if save_edit:
+                        normalized_name = edited_name.strip()
+                        normalized_desc = edited_description.strip()
+                        normalized_client = edited_client_org.strip()
+
+                        if not normalized_name or not normalized_desc:
+                            st.error("请填写必填项：案件名称、案情描述。")
+                        else:
+                            requires_reanalysis = any([
+                                normalized_name != (case.name or "").strip(),
+                                edited_goal_type != (case.goal_type or ""),
+                                normalized_desc != (case.case_description or "").strip(),
+                            ])
+
+                            try:
+                                case.name = normalized_name
+                                case.client_org = normalized_client
+                                case.goal_type = edited_goal_type
+                                case.case_description = normalized_desc
+                                if requires_reanalysis:
+                                    _reset_case_outputs(db, case_id)
+                                    case.status = "pending"
+                                db.commit()
+                                st.session_state["current_case_name"] = normalized_name
+                                st.session_state[edit_toggle_key] = False
+                                st.session_state[notice_key] = "案件信息已更新。" + (" 如涉及关键字段变更，系统已清空旧评估结果。" if requires_reanalysis else "")
+                                st.rerun()
+                            except Exception as e:
+                                db.rollback()
+                                st.error(f"更新失败: {e}")
+
+            with st.expander("查看案情描述", expanded=True):
+                st.markdown(case.case_description)
+
+            if case.status in ("completed", "partial") and not eval_data:
+                latest = db.query(ScoreSnapshot).filter(ScoreSnapshot.case_id == case_id).order_by(ScoreSnapshot.id.desc()).first()
+                if latest:
+                    col_m1, col_m2, col_m3 = st.columns(3)
+                    with col_m1:
+                        metric_card("综合得分", "未生成" if latest.final_score is None else f"{latest.final_score}", "分" if latest.final_score is not None else "")
+                    with col_m2:
+                        metric_card("置信度", f"{latest.confidence_score}%", "")
+                    with col_m3:
+                        metric_card("建议", latest.recommendation, "", COLORS["primary"])
+                    st.markdown("")
+
+            if not RUNTIME_CONFIG["ready"] and not _use_mock_mode():
+                st.error("真实 Demo 模式缺少必要配置：" + "、".join(RUNTIME_CONFIG["missing_required"]) + "。当前不允许发起真实评估或刷新外部检索。")
+
+            disable_real_actions = (not RUNTIME_CONFIG["ready"] and not _use_mock_mode())
+
+            # 评估按钮：开始评估 / 刷新外部检索
+            col_sp1, col_btn, col_refresh, col_sp2 = st.columns([1, 1.4, 1.4, 1])
+            with col_btn:
+                btn_label = "重新评估" if eval_data else "开始评估"
+                do_eval = st.button(btn_label, type="primary", use_container_width=True, disabled=disable_real_actions)
+            with col_refresh:
+                do_refresh = st.button(
+                    "刷新外部检索",
+                    use_container_width=True,
+                    disabled=disable_real_actions or not eval_data or _use_mock_mode(),
+                    help="会刷新北大法宝/企查查缓存，并更新结果展示。" if not _use_mock_mode() else "Mock 模式下不执行真实外部检索。",
+                )
+
+        overview_placeholder = st.empty()
+        detail_placeholder = st.empty()
+        result_placeholder = st.empty()
+        render_counter = {"value": 0}
+
+        def render_eval_workspace(view_data=None, pending_message=None, interactive=True):
+            data = view_data if view_data is not None else eval_data
+            render_counter["value"] += 1
+            render_token = f"{case_id}_{render_counter['value']}"
+            flow_state = _ensure_eval_flow_state(case_id, data)
+            with overview_placeholder.container():
+                top_cols = st.columns([1.7, 1.0], gap="medium")
+                with top_cols[0]:
+                    _render_eval_flow_card(case_id, flow_state, interactive=interactive and not flow_state.get("running"), render_token=render_token)
+                with top_cols[1]:
+                    _render_moot_status_card(case_id, data, flow_state, render_token=render_token)
+            with detail_placeholder.container():
+                _render_eval_detail_card(case_id, case, data, flow_state, pending_message=pending_message, render_token=render_token)
+            result_placeholder.empty()
+            if data and not flow_state.get("running"):
+                with result_placeholder.container():
+                    _render_eval_compact_summary(data, case_id, render_token=render_token)
+            return flow_state
+
+        render_eval_workspace(eval_data, interactive=bool(eval_data))
+
+        if do_refresh and eval_data:
+            latest_report = db.query(Report).filter(Report.case_id == case_id).order_by(Report.id.desc()).first()
+            refreshed_external = _refresh_external_results(case, latest_report.markdown_content if latest_report else "")
+            eval_data["external_results"] = refreshed_external
+            eval_data["retrieval_status"] = _collect_retrieval_status(refreshed_external)
+            eval_data["confidence_score"] = calculate_confidence_score(
+                {name: eval_data.get(name, {}) for name in ["rights", "infringement", "procedure", "moot", "financial", "precedent", "evidence"]},
+                eval_data["retrieval_status"],
+                CRITICAL_DIMENSIONS,
+            )
+            st.session_state[eval_key] = eval_data
+            _save_eval_cache(case_id, eval_data)
+            _persist_external_cache(case_id, refreshed_external)
+            accent_notice("外部检索缓存已刷新，结果页将继续展示缓存版本。")
+            st.rerun()
 
         # ════════════════════════════════════════════════════
         # 评估执行流水线
@@ -526,259 +1723,366 @@ elif page == "评估分析":
         if do_eval:
             progress = st.progress(0, "初始化评估引擎...")
             evidence_texts = st.session_state.get("evidence_text_extra", "")
+            completed_steps = []
+            live_eval_data = {
+                "external_results": {},
+                "qcc_data": {},
+            }
+
+            def sync_eval_step(step_id: str, pending_message: str | None = None):
+                _set_eval_flow_state(
+                    case_id,
+                    running=True,
+                    current_step=step_id,
+                    completed_steps=completed_steps,
+                    selected_step=step_id,
+                )
+                render_eval_workspace(live_eval_data, pending_message=pending_message, interactive=False)
 
             # ── 维度一：法律可行性 ──
-            section_banner("维度一：法律可行性", "回答「能不能诉」", COLORS["primary"])
+            sync_eval_step("rights", "正在进行权利基础分析：北大法宝检索法条，并结合案情与证据文本生成判断。")
 
             # 1.1 权利基础
-            rights_default = {"score": 60, "sub_scores": {}, "analysis": "评估失败", "strengths": [], "risks": ["评估异常"], "red_flag": False}
+            external_results = {
+                "generated_at": datetime.now().isoformat(),
+                "mode": RUNTIME_CONFIG["mode_label"],
+            }
+            live_eval_data["external_results"] = external_results
+            rights_default = {"score": 0, "sub_scores": {}, "analysis": "", "strengths": [], "risks": [], "red_flag": False}
             progress.progress(8, "1/7 权利基础评估...")
-            with st.spinner("📚 北大法宝检索法条 → DeepSeek 分析..."):
-                try: pkulaw_rights = search_for_rights_foundation()
-                except: pkulaw_rights = {"laws": [], "cases": []}
+            with st.spinner("北大法宝检索法条 -> 模型分析..."):
+                pkulaw_rights = _safe_external_call(RETRIEVAL_LABELS["rights_retrieval"], search_for_rights_foundation)
+                external_results["rights_retrieval"] = pkulaw_rights
                 try:
-                    rights_result = evaluate_rights_foundation(case.case_description, uploaded_texts=evidence_texts, pkulaw_data=pkulaw_rights)
+                    rights_raw = evaluate_rights_foundation(
+                        case.case_description,
+                        uploaded_texts=evidence_texts,
+                        pkulaw_data=pkulaw_rights if pkulaw_rights.get("status") == "completed" else None,
+                    )
                 except Exception as exc:
-                    rights_result = {"error": str(exc)[:200]}
-            if rights_result.get("error"):
-                st.warning("⚠️ 权利基础异常，使用默认分")
-                rights_result = rights_default
-            sub_scores = [{"name": {"validity":"商标有效性","usage_continuity":"连续使用","coverage":"覆盖范围","well_known_status":"驰名地位","risk_of_invalidation":"无效风险"}.get(k, k),
-                           "score": v, "status": "pass" if v >= 60 else "warning"}
-                          for k, v in rights_result.get('sub_scores', {}).items()]
-            dim_card("1.1 权利基础评估", rights_result.get('score', 0),
-                     rights_result.get('analysis', ''), sub_items=sub_scores,
-                     extra="优势: " + ", ".join(rights_result.get('strengths', ['-'])) + "\n\n风险: " + ", ".join(rights_result.get('risks', ['-'])))
-            st.caption("📚 北大法宝（实时检索）" if rights_result.get("source") == "pkulaw" else "🤖 DeepSeek")
+                    rights_raw = {"error": str(exc)[:200]}
+            rights_result = _build_dimension_result(rights_raw, rights_default, "权利基础")
+            live_eval_data["rights"] = rights_result
+            live_eval_data["external_results"] = external_results
+            completed_steps.append("rights")
+            sync_eval_step("rights")
 
             # 1.2 侵权认定
-            inf_default = {"score": 60, "elements": [], "analysis": "评估失败", "strengths": [], "risks": ["评估异常"], "red_flag": False}
+            sync_eval_step("infringement", "正在进行侵权认定分析：检索类案并校验侵权构成要素。")
+            inf_default = {"score": 0, "elements": [], "analysis": "", "strengths": [], "risks": [], "red_flag": False}
             progress.progress(22, "2/7 侵权认定评估...")
-            with st.spinner("📚 北大法宝检索类案 → DeepSeek 五要件分析..."):
-                try: pkulaw_inf = search_for_infringement()
-                except: pkulaw_inf = {"laws": [], "cases": []}
+            with st.spinner("北大法宝检索类案 -> 五要件分析..."):
+                pkulaw_inf = _safe_external_call(RETRIEVAL_LABELS["infringement_retrieval"], search_for_infringement)
+                external_results["infringement_retrieval"] = pkulaw_inf
                 try:
-                    infringement_result = evaluate_infringement(case.case_description,
-                        rights_assessment=str(rights_result.get('analysis', '')),
-                        uploaded_texts=evidence_texts, pkulaw_data=pkulaw_inf)
+                    infringement_raw = evaluate_infringement(
+                        case.case_description,
+                        rights_assessment=str(rights_result.get("analysis", "")),
+                        uploaded_texts=evidence_texts,
+                        pkulaw_data=pkulaw_inf if pkulaw_inf.get("status") == "completed" else None,
+                    )
                 except Exception as exc:
-                    infringement_result = {"error": str(exc)[:200]}
-            if infringement_result.get("error"):
-                st.warning("⚠️ 侵权认定异常，使用默认分")
-                infringement_result = inf_default
-            el_items = [{"name": el['name'], "score": el['score'], "status": el.get('status','pass'), "detail": el.get('analysis','')} for el in infringement_result.get('elements', [])]
-            dim_card("1.2 侵权认定评估", infringement_result.get('score', 0),
-                     infringement_result.get('analysis', ''), sub_items=el_items)
-            st.caption("📚 北大法宝（实时检索）" if infringement_result.get("source") == "pkulaw" else "🤖 DeepSeek")
+                    infringement_raw = {"error": str(exc)[:200]}
+            infringement_result = _build_dimension_result(infringement_raw, inf_default, "侵权认定")
+            live_eval_data["infringement"] = infringement_result
+            live_eval_data["external_results"] = external_results
+            completed_steps.append("infringement")
+            sync_eval_step("infringement")
 
             # 1.3 诉讼程序
-            proc_default = {"score": 60, "items": [], "analysis": "评估失败", "block_items": [], "red_flag": False}
+            sync_eval_step("procedure", "正在进行诉讼程序审查：校验时效、管辖与主体适格等程序条件。")
+            proc_default = {"score": 0, "items": [], "analysis": "", "block_items": [], "red_flag": False}
             progress.progress(36, "3/7 程序审查...")
-            with st.spinner("📚 北大法宝检索程序法条 → DeepSeek 审查..."):
-                try: pkulaw_proc = search_for_procedure()
-                except: pkulaw_proc = {"laws": [], "cases": []}
+            with st.spinner("北大法宝检索程序法条 -> 程序审查..."):
+                pkulaw_proc = _safe_external_call(RETRIEVAL_LABELS["procedure_retrieval"], search_for_procedure)
+                external_results["procedure_retrieval"] = pkulaw_proc
                 try:
-                    procedure_result = evaluate_procedure(case.case_description, party_info=case.client_org or "", pkulaw_data=pkulaw_proc)
+                    procedure_raw = evaluate_procedure(
+                        case.case_description,
+                        party_info=case.client_org or "",
+                        pkulaw_data=pkulaw_proc if pkulaw_proc.get("status") == "completed" else None,
+                    )
                 except Exception as exc:
-                    procedure_result = {"error": str(exc)[:200]}
-            if procedure_result.get("error"):
-                st.warning("⚠️ 程序审查异常，使用默认分")
-                procedure_result = proc_default
-            proc_items = [{"name": p['name'], "status": p.get('status','pass'), "detail": p.get('detail','')} for p in procedure_result.get('items', [])]
-            dim_card("1.3 诉讼程序审查", procedure_result.get('score', 0),
-                     procedure_result.get('analysis', ''), sub_items=proc_items)
-            st.caption("📚 北大法宝（实时检索）" if procedure_result.get("source") == "pkulaw" else "🤖 DeepSeek")
+                    procedure_raw = {"error": str(exc)[:200]}
+            procedure_result = _build_dimension_result(procedure_raw, proc_default, "诉讼程序")
+            live_eval_data["procedure"] = procedure_result
+            live_eval_data["external_results"] = external_results
+            completed_steps.append("procedure")
+            sync_eval_step("procedure")
 
             # 1.4 模拟法庭
-            moot_default = {"correction_coefficient": 1.0, "rounds": [], "judge_summary": "模拟法庭异常"}
+            sync_eval_step("moot", "正在进行模拟法庭对抗检验：模拟原告、被告与法官多轮交锋。")
+            moot_default = {"correction_coefficient": 1.0, "rounds": [], "judge_summary": "", "defense_strength": 0, "focus_points": [], "weak_points": [], "judge_scores": {}}
             progress.progress(50, "4/7 模拟法庭对抗检验...")
-            section_banner("1.4 模拟法庭（多Agent对抗检验）", "原告Agent ↔ 被告Agent ↔ 法官Agent", COLORS["accent"])
-            with st.spinner("📚 北大法宝检索抗辩模式 → DeepSeek 五步庭审..."):
-                try: pkulaw_moot = search_for_moot_court()
-                except: pkulaw_moot = {"laws": [], "cases": []}
+            with st.spinner("北大法宝检索抗辩模式 -> 五步庭审..."):
+                pkulaw_moot = _safe_external_call(RETRIEVAL_LABELS["moot_retrieval"], search_for_moot_court)
+                external_results["moot_retrieval"] = pkulaw_moot
                 try:
-                    moot_result = run_moot_court_simulation(case.case_description,
-                        rights_assessment=str(rights_result.get('analysis', '')),
-                        infringement_assessment=str(infringement_result.get('analysis', '')),
-                        evidence_summary=evidence_texts[:1500] if evidence_texts else "",
-                        pkulaw_data=pkulaw_moot)
-                except Exception as exc:
-                    moot_result = {"error": str(exc)[:200]}
-            if moot_result.get("error") and not moot_result.get("rounds"):
-                st.warning("⚠️ 模拟法庭异常，使用默认系数 1.0")
-                moot_result = moot_default
-            correction_coeff = moot_result.get('correction_coefficient', 1.0)
+                    def on_moot_round(partial_moot: dict, round_index: int, total_rounds: int) -> None:
+                        live_eval_data["moot"] = partial_moot
+                        live_eval_data["external_results"] = external_results
+                        current_round = (partial_moot.get("rounds") or [{}])[-1]
+                        current_role = current_round.get("role_name", "角色")
+                        current_stage = current_round.get("step_name", "模拟法庭")
+                        stage_progress = 50 + int(((round_index + 1) / max(total_rounds, 1)) * 12)
+                        progress.progress(min(stage_progress, 62), f"4/7 模拟法庭进行中：{current_stage} · {current_role}")
+                        sync_eval_step("moot", f"模拟法庭进行中：{current_stage} · {current_role}")
 
-            # 维度一小计
+                    moot_raw = _run_moot_court_with_updates(
+                        case.case_description,
+                        rights_assessment=str(rights_result.get("analysis", "")),
+                        infringement_assessment=str(infringement_result.get("analysis", "")),
+                        evidence_summary=evidence_texts[:1500] if evidence_texts else "",
+                        on_round=on_moot_round,
+                    )
+                except Exception as exc:
+                    moot_raw = {"error": str(exc)[:200]}
+            moot_result = _build_dimension_result(moot_raw, moot_default, "模拟法庭")
+            live_eval_data["moot"] = moot_result
+            live_eval_data["external_results"] = external_results
+            completed_steps.append("moot")
+            correction_coeff = moot_result.get("correction_coefficient", 1.0) if moot_result.get("status") != "failed" else 1.0
+            live_eval_data["correction_coeff"] = correction_coeff
+            sync_eval_step("moot", "模拟法庭已完成，正在汇总对抗结果。")
+
             legal_score = calculate_legal_feasibility(
-                rights_result.get('score', 0), infringement_result.get('score', 0),
-                procedure_result.get('score', 0), correction_coeff
+                rights_result.get("score", 0),
+                infringement_result.get("score", 0),
+                procedure_result.get("score", 0),
+                correction_coeff,
             )
 
-            # ── 维度二：业务预期 ──
+            live_eval_data["legal_score"] = legal_score
             # 2.1 财务回报
-            fin_default = {"score": 50, "damages_estimate": {}, "cost_estimate": "-", "time_estimate": {}, "recovery_probability": "-", "analysis": "评估失败"}
+            sync_eval_step("financial", "正在进行财务回报评估：结合企查查画像与判赔类案估算回款空间。")
+            fin_default = {"score": 0, "damages_estimate": {}, "cost_estimate": "-", "time_estimate": {}, "recovery_probability": "-", "analysis": ""}
             progress.progress(64, "5/7 财务回报评估...")
-
-            # Phase 1: LLM 提取被告身份
-            defend_info = None
-            if case.case_description:
-                with st.spinner("🔍 识别被告身份（LLM NER + 类型判断）..."):
-                    try:
-                        phase1 = extract_defendant_info(case.case_description)
-                        defendants = phase1.get("defendants", [])
-                        if defendants:
-                            for d in defendants:
-                                if isinstance(d, dict) and d.get("role") == "primary_defendant":
-                                    defend_info = d
-                                    break
-                            if not defend_info:
-                                defend_info = defendants[0]
-                    except Exception:
-                        defend_info = None
-
-            # Phase 2: 企查查查询
-            qcc_data = None
-            if defend_info:
+            defend_info = _extract_primary_defendant(case.case_description)
+            external_results["defendant_info"] = defend_info
+            if _use_mock_mode():
+                qcc_data = _build_external_failure("企查查被告财务画像", "Mock 模式未调用企查查", status="skipped", include_collections=False)
+            elif defend_info.get("status") == "completed" and defend_info.get("name"):
                 dname = defend_info.get("name", "")
                 dtype = defend_info.get("type", "enterprise")
-                with st.spinner(f"🏢 企查查调取被告财务画像（{dname}，{'企业' if dtype != 'individual' else '自然人'}）..."):
-                    try:
-                        qcc_data = search_for_financial_qcc_full(defend_info)
-                    except Exception:
-                        qcc_data = {"_summary": "企查查调用失败", "stages": {}, "metrics": {}}
+                with st.spinner(f"企查查调取被告财务画像（{dname}，{'企业' if dtype != 'individual' else '自然人'}）..."):
+                    qcc_data = _safe_external_call(
+                        "企查查被告财务画像",
+                        lambda: search_for_financial_qcc_full(defend_info),
+                        include_collections=False,
+                    )
             else:
-                qcc_data = {"_summary": "⚠️ 未识别到被告主体名称，无法调用企查查", "stages": {}, "metrics": {}}
+                qcc_data = {
+                    "status": "not_applicable",
+                    "error": defend_info.get("error", "未识别到被告主体名称"),
+                    "_summary": "未识别到被告主体名称，未执行企查查检索",
+                    "stages": {},
+                    "metrics": {},
+                }
+            external_results["qcc_data"] = qcc_data
 
-            with st.spinner("📚 北大法宝检索判赔数据 → DeepSeek 预测..."):
-                try: pkulaw_fin = search_for_financial()
-                except: pkulaw_fin = {"laws": [], "cases": []}
+            with st.spinner("北大法宝检索判赔数据 -> 财务预测..."):
+                pkulaw_fin = _safe_external_call(RETRIEVAL_LABELS["financial_retrieval"], search_for_financial)
+                external_results["financial_retrieval"] = pkulaw_fin
                 try:
-                    financial_result = evaluate_financial_return(case.case_description,
-                        infringement_severity=str(infringement_result.get('analysis', '')),
-                        case_law_references="", pkulaw_data=pkulaw_fin, qcc_data=qcc_data)
+                    financial_raw = evaluate_financial_return(
+                        case.case_description,
+                        infringement_severity=str(infringement_result.get("analysis", "")),
+                        case_law_references="",
+                        pkulaw_data=pkulaw_fin if pkulaw_fin.get("status") == "completed" else None,
+                        qcc_data=qcc_data,
+                    )
                 except Exception as exc:
-                    financial_result = {"error": str(exc)[:200]}
-            if financial_result.get("error"):
-                st.warning("⚠️ 财务评估异常，使用默认分")
-                financial_result = fin_default
-            fin_score = financial_result.get('score', 50)
-            de = financial_result.get('damages_estimate', {})
-            te = financial_result.get('time_estimate', {})
-            fin_extra = []
-            if de: fin_extra.append(f"判赔预测: P10=¥{de.get('p10','-')} / P50=¥{de.get('p50','-')} / P90=¥{de.get('p90','-')}")
-            fin_extra.append(f"预估成本: ¥{financial_result.get('cost_estimate','-')}")
-            if te: fin_extra.append(f"时间: 一审{te.get('first_instance_months','-')}月 + 二审{te.get('second_instance_months','-')}月 + 执行{te.get('enforcement_months','-')}月")
-            fin_extra.append(f"回款概率: {financial_result.get('recovery_probability','-')}%")
-            dim_card("2.1 财务回报评估", fin_score, financial_result.get('analysis', ''), extra="\n".join(fin_extra))
-
-            # ── 企查查 · 被告财务画像（评估流程中展示）──
-            if qcc_data and qcc_data.get("stages"):
-                with st.expander("🏢 企查查 · 被告财务画像（实测数据）", expanded=False):
-                    st.caption(qcc_data.get("_summary", ""))
-                    metrics = qcc_data.get("metrics", {})
-                    if metrics:
-                        c1, c2, c3 = st.columns(3)
-                        c1.metric("回款概率", f"{metrics.get('recovery_probability', '-')}%")
-                        c2.metric("判赔方向", metrics.get('damages_adjustment', '-'))
-                        c3.metric("时间延长", f"+{metrics.get('time_extra_months', 0)}月")
-                        reds = metrics.get("red_flags", [])
-                        greens = metrics.get("green_flags", [])
-                        if reds: st.error("🚨 " + " | ".join(reds[:3]))
-                        if greens: st.success("✅ " + " | ".join(greens[:3]))
-                    # 风险明细
-                    d_stage = qcc_data.get("stages", {}).get("D_风险下钻", {})
-                    if d_stage:
-                        lines = []
-                        for k in ("失信信息","被执行人","终本案件","限高消费","经营异常","严重违法"):
-                            v = d_stage.get(k, {})
-                            if isinstance(v, dict) and v.get("_summary"):
-                                lines.append(f"- {k}: {v['_summary']}")
-                        if lines:
-                            st.caption("**风险明细**"); st.text("\n".join(lines))
-                    f_stage = qcc_data.get("stages", {}).get("F_经营规模", {})
-                    if f_stage:
-                        st.caption(f"**经营规模**: {f_stage.get('_summary','')}")
-            elif qcc_data and qcc_data.get("_summary"):
-                st.caption(f"🏢 {qcc_data['_summary']}")
+                    financial_raw = {"error": str(exc)[:200]}
+            financial_result = _build_dimension_result(financial_raw, fin_default, "财务回报")
+            live_eval_data["financial"] = financial_result
+            live_eval_data["qcc_data"] = qcc_data or {}
+            live_eval_data["external_results"] = external_results
+            completed_steps.append("financial")
+            sync_eval_step("financial")
 
             # 2.2 判例价值
-            prec_default = {"score": 50, "first_case_index": "-", "influence_level": "-", "analysis": "评估失败"}
+            sync_eval_step("precedent", "正在进行判例价值评估：检索首案价值并判断影响力空间。")
+            prec_default = {"score": 0, "first_case_index": "-", "influence_level": "-", "analysis": ""}
             progress.progress(78, "6/7 判例价值评估...")
-            with st.spinner("📚 北大法宝首案检索 → DeepSeek 判例价值判断..."):
-                try: pkulaw_prec = search_for_precedent(case.case_description)
-                except: pkulaw_prec = {"laws": [], "cases": []}
+            with st.spinner("北大法宝首案检索 -> 判例价值判断..."):
+                pkulaw_prec = _safe_external_call(RETRIEVAL_LABELS["precedent_retrieval"], lambda: search_for_precedent(case.case_description))
+                external_results["precedent_retrieval"] = pkulaw_prec
                 try:
-                    precedent_result = evaluate_precedent_value(case.case_description,
-                        case_law_references="", pkulaw_data=pkulaw_prec)
+                    precedent_raw = evaluate_precedent_value(
+                        case.case_description,
+                        case_law_references="",
+                        pkulaw_data=pkulaw_prec if pkulaw_prec.get("status") == "completed" else None,
+                    )
                 except Exception as exc:
-                    precedent_result = {"error": str(exc)[:200]}
-            if precedent_result.get("error"):
-                st.warning("⚠️ 判例价值异常，使用默认分")
-                precedent_result = prec_default
-            prec_score = precedent_result.get('score', 50)
-            dim_card("2.2 判例价值评估", prec_score, precedent_result.get('analysis', ''),
-                     extra=f"首案指数: {precedent_result.get('first_case_index','-')} | 影响力级别: {precedent_result.get('influence_level','-')}")
+                    precedent_raw = {"error": str(exc)[:200]}
+            precedent_result = _build_dimension_result(precedent_raw, prec_default, "判例价值")
+            live_eval_data["precedent"] = precedent_result
+            live_eval_data["business_score"] = calculate_business_expectation(financial_result.get("score", 0), precedent_result.get("score", 0), case.goal_type)
+            live_eval_data["external_results"] = external_results
+            completed_steps.append("precedent")
+            sync_eval_step("precedent")
 
-            business_score = calculate_business_expectation(
-                financial_result.get('score', 50), precedent_result.get('score', 50), case.goal_type)
+            business_score = calculate_business_expectation(financial_result.get("score", 0), precedent_result.get("score", 0), case.goal_type)
 
-            # ── 维度三：证据就绪度 ──
+            # 维度三：证据就绪度
+            sync_eval_step("evidence", "正在进行证据就绪度评估：逐项检查关键证据是否充足，并生成补证建议。")
             progress.progress(92, "7/7 证据就绪度评估...")
+            evid_default = {"score": 0, "evidence_matrix": [], "analysis": "", "missing_items": [], "remediation_suggestions": [], "collection_advice": ""}
             with st.spinner("正在逐项核验证据完整性..."):
-                evidence_result = evaluate_evidence_readiness(case.case_description,
-                    uploaded_evidence_texts=evidence_texts, evidence_count=0)
-            if evidence_result.get("error"):
-                evidence_result = {"score": 60, "evidence_matrix": [], "analysis": "", "missing_items": [], "remediation_suggestions": [], "collection_advice": "", "error": evidence_result.get("error")}
+                try:
+                    evidence_raw = evaluate_evidence_readiness(
+                        case.case_description,
+                        uploaded_evidence_texts=evidence_texts,
+                        evidence_count=0,
+                    )
+                except Exception as exc:
+                    evidence_raw = {"error": str(exc)[:200]}
+            evidence_result = _build_dimension_result(evidence_raw, evid_default, "证据就绪度")
+            live_eval_data["evidence"] = evidence_result
+            live_eval_data["external_results"] = external_results
+            completed_steps.append("evidence")
+            evidence_score = evidence_result.get("score", 0)
+            live_eval_data["evidence_score"] = evidence_score
+            sync_eval_step("evidence")
 
-            evidence_score = evidence_result.get('score', 60)
+            dimension_results = {
+                "rights": rights_result,
+                "infringement": infringement_result,
+                "procedure": procedure_result,
+                "moot": moot_result,
+                "financial": financial_result,
+                "precedent": precedent_result,
+                "evidence": evidence_result,
+            }
+            integrity = evaluate_data_integrity(dimension_results, CRITICAL_DIMENSIONS)
+            retrieval_status = _collect_retrieval_status(external_results)
+            confidence_score = calculate_confidence_score(dimension_results, retrieval_status, CRITICAL_DIMENSIONS)
+            integrity_payload = _build_integrity_payload(integrity)
 
-            # ── 综合评分 ──
             progress.progress(97, "计算综合评分...")
-            final_score = calculate_overall_score(legal_score, business_score, evidence_score)
-            rec = generate_recommendation(final_score, procedure_result.get('items', []))
+            final_score = calculate_overall_score(legal_score, business_score, evidence_score) if integrity.get("is_complete") else None
+            missing_dimensions = integrity_payload.get("critical_issues", [])
+            rec = generate_recommendation(final_score, procedure_result.get("items", []), integrity.get("is_complete"), missing_dimensions)
 
-            # ── 🔍 防幻觉验证阶段（progress 95，报告生成前）──
-            with st.spinner("🔍 北大法宝防幻觉验证（adjust_provisions → law_recognition → anhao_recognition → 交叉验证）..."):
-                # 先生成报告草稿用于验证扫描
-                rule_results_for_verif = [
-                    {"rule_name": it.get("name", "未知程序项"), "severity": "pass" if it.get("status") in ("pass","warning","block") else "warning",
-                     "result": it.get("detail", ""), "reason": it.get("detail", "")}
-                    for it in procedure_result.get('items', [])
+            action_items = []
+            if integrity_payload.get("critical_issues"):
+                action_items.append("优先完成以下关键维度：" + "、".join(integrity_payload["critical_issues"]))
+            for suggestion in evidence_result.get("remediation_suggestions", [])[:2]:
+                action_items.append(suggestion)
+
+            rule_results_for_verif = [
+                {
+                    "rule_name": it.get("name", "未知程序项"),
+                    "severity": it.get("status", "warning") if it.get("status") in ("pass", "warning", "block") else "warning",
+                    "result": it.get("detail", ""),
+                    "reason": it.get("detail", ""),
+                }
+                for it in procedure_result.get("items", [])
+            ]
+            report_score_payload = {
+                "legal_feasibility": legal_score,
+                "business_expectation": business_score,
+                "evidence_readiness": evidence_score,
+                "final_score": final_score,
+                "recommendation": rec["recommendation"],
+                "confidence_score": confidence_score,
+                "reason": rec["reason"],
+                "action_items": action_items,
+                "data_integrity": integrity_payload,
+            }
+            legal_analysis_payload = {
+                "elements": [
+                    {"element": "权利基础", "score": rights_result.get("score", 0), "analysis": rights_result.get("analysis", ""), "evidence_status": "-", "risks": rights_result.get("risks", [])},
+                    {"element": "侵权认定", "score": infringement_result.get("score", 0), "analysis": infringement_result.get("analysis", ""), "evidence_status": "-", "risks": infringement_result.get("risks", [])},
+                    {"element": "诉讼程序", "score": procedure_result.get("score", 0), "analysis": procedure_result.get("analysis", ""), "evidence_status": "-", "risks": procedure_result.get("block_items", [])},
                 ]
-                report_md_pre = generate_markdown_report(
-                    {"name": case.name, "cause_type": case.cause_type, "goal_type": case.goal_type, "client_org": case.client_org},
-                    {"legal_feasibility": legal_score, "business_expectation": business_score, "evidence_readiness": evidence_score,
-                     "final_score": final_score, "recommendation": rec['recommendation'], "confidence_score": 70, "reason": rec['reason'], "action_items": []},
-                    rule_results_for_verif,
-                    {"elements": [
-                        {"element":"权利基础","score":rights_result.get('score',0),"analysis":rights_result.get('analysis',''),"evidence_status":"-","risks":rights_result.get('risks',[])},
-                        {"element":"侵权认定","score":infringement_result.get('score',0),"analysis":infringement_result.get('analysis',''),"evidence_status":"-","risks":infringement_result.get('risks',[])},
-                        {"element":"诉讼程序","score":procedure_result.get('score',0),"analysis":procedure_result.get('analysis',''),"evidence_status":"-","risks":procedure_result.get('block_items',[])},
-                    ]})
-                vresult = run_verification_phase(report_md_pre)
-                vs = vresult["summary"]
+            }
+            report_md_pre = generate_markdown_report(
+                {"name": case.name, "cause_type": case.cause_type, "goal_type": case.goal_type, "client_org": case.client_org},
+                report_score_payload,
+                rule_results_for_verif,
+                legal_analysis_payload,
+            )
+
+            if _use_mock_mode():
+                vresult = _build_external_failure("北大法宝防幻觉验证", "Mock 模式未执行防幻觉验证", status="skipped", include_collections=False)
+                vresult["summary"] = {"laws_verified": False, "cases_verified": False, "laws_found": 0, "cases_found": 0, "hallucinations": []}
+            else:
+                with st.spinner("北大法宝防幻觉验证（adjust_provisions -> law_recognition -> anhao_recognition）..."):
+                    vresult = _safe_external_call("北大法宝防幻觉验证", lambda: run_verification_phase(report_md_pre), include_collections=False)
+            vs = vresult.get("summary", {"laws_verified": False, "cases_verified": False, "laws_found": 0, "cases_found": 0, "hallucinations": []})
+            external_results["verification"] = vresult
+            if isinstance(vresult, dict):
+                for key in ("adjust_provisions", "law_recognition", "anhao_recognition"):
+                    if key in vresult:
+                        external_results[key] = vresult.get(key)
 
             st.markdown("---")
-            with st.expander("🔍 北大法宝 · 防幻觉验证（全部通过）" if vs["laws_verified"] else "🔍 北大法宝 · 防幻觉验证", expanded=True):
-                col_v1, col_v2, col_v3, col_v4 = st.columns(4)
-                with col_v1:
-                    st.metric("法条校验", "✅" if vs["laws_verified"] else "⚠️",
-                              delta=f"识别{vs['laws_found']}条" if vs["laws_found"] else "未引用")
-                with col_v2:
-                    st.metric("案号校验", "✅" if vs["cases_verified"] else "⚠️",
-                              delta=f"{vs['cases_found']}案号" if vs['cases_found'] else "0案号")
-                with col_v3:
-                    hall_count = len(vs["hallucinations"])
-                    st.metric("幻觉排查", "✅" if not hall_count else "⚠️",
-                              delta="无" if not hall_count else f"{hall_count}条")
-                with col_v4:
-                    st.metric("总体", "✅ 通过" if vs["laws_verified"] else "⚠️ 需复查")
-                if vs["hallucinations"]:
-                    for h in vs["hallucinations"]:
-                        st.warning(h)
+            if vresult.get("status") == "skipped":
+                accent_notice(vresult.get("_summary", "当前模式未执行防幻觉验证。"))
+            else:
+                with st.expander("北大法宝 · 防幻觉验证", expanded=True):
+                    col_v1, col_v2, col_v3, col_v4 = st.columns(4)
+                    with col_v1:
+                        st.metric("法条校验", "通过" if vs.get("laws_verified") else "待复查", delta=f"识别{vs.get('laws_found', 0)}条" if vs.get("laws_found") else "未引用")
+                    with col_v2:
+                        st.metric("案号校验", "通过" if vs.get("cases_verified") else "待复查", delta=f"{vs.get('cases_found', 0)}案号" if vs.get("cases_found") else "0案号")
+                    with col_v3:
+                        hall_count = len(vs.get("hallucinations", []))
+                        st.metric("幻觉排查", "通过" if not hall_count else "待复查", delta="无" if not hall_count else f"{hall_count}条")
+                    with col_v4:
+                        st.metric("总体", "完整" if integrity.get("is_complete") else "部分完成")
+                    for hallucination in vs.get("hallucinations", []):
+                        accent_notice(hallucination)
 
-            # ── 存入 session state ──
+            rule_results_for_report = [
+                {
+                    "rule_name": it.get("name", "未知程序项"),
+                    "severity": it.get("status", "warning") if it.get("status") in ("pass", "warning", "block") else {"满足": "pass", "存疑": "warning", "不满足": "block"}.get(it.get("status", "存疑"), "warning"),
+                    "result": it.get("detail", ""),
+                    "reason": it.get("detail", ""),
+                }
+                for it in procedure_result.get("items", [])
+            ]
+            report_md = generate_markdown_report(
+                {"name": case.name, "cause_type": case.cause_type, "goal_type": case.goal_type, "client_org": case.client_org},
+                report_score_payload,
+                rule_results_for_report,
+                legal_analysis_payload,
+            )
+
+            hall_count = len(vs.get("hallucinations", []))
+            verification_section = f"""
+
+## 七、北大法宝防幻觉验证
+
+- 法条校验: {vs.get('laws_found', 0)} 条
+- 案号校验: {vs.get('cases_found', 0)} 个
+- 幻觉排查: {'通过' if not hall_count else f'发现 {hall_count} 处可疑引用'}
+"""
+            report_md += verification_section
+
+            if not _use_mock_mode():
+                try:
+                    legal_analysis_text = (
+                        f"权利基础：{rights_result.get('analysis', '')}。"
+                        f"侵权认定：{infringement_result.get('analysis', '')}。"
+                        f"诉讼程序：{procedure_result.get('analysis', '')}。"
+                    )
+                    enhance_resp = get_linked_content(legal_analysis_text[:3000])
+                    if enhance_resp and "result" in enhance_resp:
+                        structured = enhance_resp["result"].get("structuredContent", enhance_resp["result"])
+                        linked_text = structured.get("result", "") if isinstance(structured, dict) else str(structured)
+                        if linked_text:
+                            report_md += f"""
+
+## 八、法律分析（法宝超链增强版）
+
+{linked_text}
+"""
+                except Exception:
+                    pass
+
             eval_data = {
                 "rights": rights_result,
                 "infringement": infringement_result,
@@ -788,454 +2092,82 @@ elif page == "评估分析":
                 "precedent": precedent_result,
                 "evidence": evidence_result,
                 "qcc_data": qcc_data or {},
+                "external_results": external_results,
+                "retrieval_status": retrieval_status,
+                "integrity": integrity_payload,
                 "legal_score": legal_score,
                 "business_score": business_score,
                 "evidence_score": evidence_score,
+                "confidence_score": confidence_score,
                 "final_score": final_score,
                 "recommendation": rec,
                 "correction_coeff": correction_coeff,
+                "report_markdown": report_md,
             }
+            live_eval_data = eval_data
             st.session_state[eval_key] = eval_data
-            for k, v in [("rights", rights_result), ("infringement", infringement_result), ("procedure", procedure_result),
-                          ("moot", moot_result), ("financial", financial_result), ("precedent", precedent_result), ("evidence", evidence_result)]:
-                st.session_state[f"{k}_{case_id}"] = v
+            _save_eval_cache(case_id, eval_data)
+            _persist_external_cache(case_id, external_results)
+            for key, value in [("rights", rights_result), ("infringement", infringement_result), ("procedure", procedure_result), ("moot", moot_result), ("financial", financial_result), ("precedent", precedent_result), ("evidence", evidence_result)]:
+                st.session_state[f"{key}_{case_id}"] = value
 
-            # ── 保存到数据库 ──
-            db.add(ScoreSnapshot(case_id=case_id, legal_score=legal_score, business_score=business_score,
-                evidence_score=evidence_score, confidence_score=70, final_score=final_score, recommendation=rec['recommendation']))
+            db.add(
+                ScoreSnapshot(
+                    case_id=case_id,
+                    legal_score=legal_score,
+                    business_score=business_score,
+                    evidence_score=evidence_score,
+                    confidence_score=confidence_score,
+                    final_score=final_score,
+                    recommendation=rec["recommendation"],
+                )
+            )
             db.commit()
 
-            # ── 生成报告 ──
-            rule_results_for_report = [
-                {"rule_name": it.get("name", "未知程序项"),
-                 "severity": (it.get("status", "warning") or "warning")
-                     if it.get("status") in ("pass", "warning", "block")
-                     else {"满足": "pass", "存疑": "warning", "不满足": "block"}.get(it.get("status", "存疑"), "warning"),
-                 "result": it.get("detail", ""), "reason": it.get("detail", "")}
-                for it in procedure_result.get('items', [])
-            ]
-            report_md = generate_markdown_report(
-                {"name": case.name, "cause_type": case.cause_type, "goal_type": case.goal_type, "client_org": case.client_org},
-                {"legal_feasibility": legal_score, "business_expectation": business_score, "evidence_readiness": evidence_score,
-                 "final_score": final_score, "recommendation": rec['recommendation'], "confidence_score": 70, "reason": rec['reason'], "action_items": []},
-                rule_results_for_report,
-                {"elements": [
-                    {"element":"权利基础","score":rights_result.get('score',0),"analysis":rights_result.get('analysis',''),"evidence_status":"-","risks":rights_result.get('risks',[])},
-                    {"element":"侵权认定","score":infringement_result.get('score',0),"analysis":infringement_result.get('analysis',''),"evidence_status":"-","risks":infringement_result.get('risks',[])},
-                    {"element":"诉讼程序","score":procedure_result.get('score',0),"analysis":procedure_result.get('analysis',''),"evidence_status":"-","risks":procedure_result.get('block_items',[])},
-                ]})
-
-            # 验证章节追加到报告
-            hall_count = len(vs["hallucinations"])
-            verification_section = f"""
-
-## 七、北大法宝防幻觉验证
-
-- ✅ 法条校验: 识别到 {vs['laws_found']} 条法规引用
-- ✅ 案号校验: 识别到 {vs['cases_found']} 个案号引用
-- {'✅' if not hall_count else '⚠️'} 幻觉排查: {'通过' if not hall_count else f'发现 {hall_count} 处可疑引用'}
-"""
-            report_md += verification_section
-
-            # 报告增强：核心法律分析段落添加法宝超链接
-            try:
-                legal_analysis_text = (
-                    f"权利基础：{rights_result.get('analysis', '')}。"
-                    f"侵权认定：{infringement_result.get('analysis', '')}。"
-                    f"诉讼程序：{procedure_result.get('analysis', '')}。"
-                )
-                enhance_resp = get_linked_content(legal_analysis_text[:3000])
-                if enhance_resp and "result" in enhance_resp:
-                    sc = enhance_resp["result"].get("structuredContent", enhance_resp["result"])
-                    linked_text = sc.get("result", "") if isinstance(sc, dict) else str(sc)
-                    if linked_text:
-                        report_md += f"""
-
-## 八、法律分析（法宝超链增强版）
-
-{linked_text}
-"""
-            except Exception:
-                pass
-
-            report_dir = Path("data/reports")
+            report_dir = RUNTIME_DIR / "reports"
             report_dir.mkdir(parents=True, exist_ok=True)
             md_path = report_dir / f"{case_id}_report.md"
             md_path.write_text(report_md, encoding="utf-8")
             db.add(Report(case_id=case_id, report_type="评估报告", markdown_content=report_md, pdf_uri=str(md_path)))
-            case.status = "completed"
+            case.status = "completed" if integrity.get("is_complete") else "partial"
             db.commit()
 
-            deepseek_results = {
-                "rights": rights_result, "infringement": infringement_result,
-                "procedure": procedure_result, "financial": financial_result,
-                "precedent": precedent_result, "evidence": evidence_result
-            }
-            generate_all_queries(case_id, case.case_description, deepseek_results)
+            if not _use_mock_mode():
+                deepseek_results = {
+                    "rights": rights_result,
+                    "infringement": infringement_result,
+                    "procedure": procedure_result,
+                    "financial": financial_result,
+                    "precedent": precedent_result,
+                    "evidence": evidence_result,
+                }
+                generate_all_queries(case_id, case.case_description, deepseek_results)
 
-            progress.progress(100, "评估完成！")
-            st.success("三维评估全部完成！请查看下方分页结果")
-            st.info("评估报告已生成，前往「评估报告」页面可下载。")
-            st.rerun()
+            _set_eval_flow_state(
+                case_id,
+                running=False,
+                current_step=None,
+                completed_steps=completed_steps,
+                selected_step=completed_steps[-1] if completed_steps else EVAL_FLOW_STEPS[0]["id"],
+            )
+            render_eval_workspace(eval_data, interactive=True)
 
-        # ════════════════════════════════════════════════════
-        # 评估结果展示 — Tab 分页
-        # ════════════════════════════════════════════════════
-        if eval_data:
-            st.markdown("---")
-
-            tab_rights, tab_infr, tab_proc, tab_moot, tab_biz, tab_evid, tab_final = st.tabs([
-                "1.1 权利基础", "1.2 侵权认定", "1.3 诉讼程序",
-                "1.4 模拟法庭", "2 业务预期", "3 证据就绪度", "综合评分"
-            ])
-
-            rights_r = eval_data["rights"]
-            infr_r = eval_data["infringement"]
-            proc_r = eval_data["procedure"]
-            moot_r = eval_data["moot"]
-            fin_r = eval_data["financial"]
-            prec_r = eval_data["precedent"]
-            evid_r = eval_data["evidence"]
-            legal_s = eval_data["legal_score"]
-            biz_s = eval_data["business_score"]
-            evid_s = eval_data["evidence_score"]
-            final_s = eval_data["final_score"]
-            rec_data = eval_data["recommendation"]
-            coeff = eval_data["correction_coeff"]
-
-            # ── Tab 1: 权利基础 ──
-            with tab_rights:
-                sub_scores = []
-                for k, v in rights_r.get('sub_scores', {}).items():
-                    label = {"validity":"商标有效性","usage_continuity":"连续使用","coverage":"覆盖范围","well_known_status":"驰名地位","risk_of_invalidation":"无效风险"}.get(k, k)
-                    sub_scores.append({"name": label, "score": v, "status": "pass" if v >= 60 else "warning"})
-                dim_card("1.1 权利基础评估", rights_r.get('score', 0),
-                         rights_r.get('analysis', ''), sub_items=sub_scores,
-                         extra="优势: " + ", ".join(rights_r.get('strengths', ['-'])) + "\n\n风险: " + ", ".join(rights_r.get('risks', ['-'])))
-
-                with st.expander("📚 北大法宝 · 法条检索（验证权利基础）", expanded=True):
-                    with st.spinner("实时调用北大法宝..."):
-                        try:
-                            pkulaw_data = search_for_rights_foundation()
-                            st.caption(f"**检索摘要**: {pkulaw_data.get('_summary','')}")
-                            for law in pkulaw_data.get("laws", [])[:5]:
-                                st.markdown(f"**{law.get('title','?')}**")
-                                if law.get('content'): st.caption(law['content'][:300])
-                                if law.get('timeliness'): st.caption(f"时效: {law['timeliness']}")
-                        except Exception as e:
-                            st.error(f"检索失败: {e}")
-
-            # ── Tab 2: 侵权认定 ──
-            with tab_infr:
-                el_items = [{"name": el['name'], "score": el['score'], "status": el.get('status','pass'), "detail": el.get('analysis','')} for el in infr_r.get('elements', [])]
-                dim_card("1.2 侵权认定评估", infr_r.get('score', 0),
-                         infr_r.get('analysis', ''), sub_items=el_items)
-
-                with st.expander("📚 北大法宝 · 类案检索（验证侵权认定标准）", expanded=True):
-                    with st.spinner("实时调用北大法宝..."):
-                        try:
-                            pkulaw_data = search_for_infringement()
-                            st.caption(f"**检索摘要**: {pkulaw_data.get('_summary','')}")
-                            for law in pkulaw_data.get("laws", [])[:3]:
-                                st.markdown(f"📖 **{law.get('title','?')}**")
-                                if law.get('content'): st.caption(law['content'][:200])
-                            for c in pkulaw_data.get("cases", [])[:5]:
-                                st.markdown(f"⚖️ **{c.get('title','?')}**")
-                                meta = " · ".join([x for x in [c.get('court',''), c.get('date','')] if x])
-                                if meta: st.caption(meta)
-                                if c.get('summary'): st.caption(c['summary'][:200])
-                        except Exception as e:
-                            st.error(f"检索失败: {e}")
-
-            # ── Tab 3: 诉讼程序 ──
-            with tab_proc:
-                proc_items = [{"name": p['name'], "status": p.get('status','pass'), "detail": p.get('detail','')} for p in proc_r.get('items', [])]
-                dim_card("1.3 诉讼程序审查", proc_r.get('score', 0),
-                         proc_r.get('analysis', ''), sub_items=proc_items)
-
-                with st.expander("📚 北大法宝 · 法条检索（验证诉讼程序依据）", expanded=True):
-                    with st.spinner("实时调用北大法宝..."):
-                        try:
-                            pkulaw_data = search_for_procedure()
-                            st.caption(f"**检索摘要**: {pkulaw_data.get('_summary','')}")
-                            for law in pkulaw_data.get("laws", [])[:5]:
-                                st.markdown(f"📖 **{law.get('title','?')}**")
-                                if law.get('content'): st.caption(law['content'][:300])
-                                if law.get('timeliness'): st.caption(f"时效: {law['timeliness']}")
-                        except Exception as e:
-                            st.error(f"检索失败: {e}")
-
-            # ── Tab 4: 模拟法庭 ──
-            with tab_moot:
-                if moot_r.get("error") and not moot_r.get("rounds"):
-                    st.warning(f"模拟法庭异常: {moot_r.get('error', '')[:200]}")
-                else:
-                    defense_strength = moot_r.get('defense_strength', 50)
-                    coeff_color = COLORS["danger"] if coeff < 0.9 else COLORS["warning"] if coeff < 1.0 else COLORS["success"]
-
-                    col_c1, col_c2 = st.columns(2)
-                    with col_c1:
-                        metric_card("对抗修正系数", f"{coeff:.2f}",
-                                    "被告抗辩有效削弱原告论证" if coeff < 1.0 else "原告论证在对抗中成立", coeff_color)
-                    with col_c2:
-                        metric_card("被告抗辩强度", f"{defense_strength}/100",
-                                    "抗辩有力" if defense_strength >= 60 else "抗辩一般" if defense_strength >= 40 else "抗辩薄弱",
-                                    COLORS["warning"])
-
-                    # 争议焦点
-                    focus_points = moot_r.get('focus_points', [])
-                    if focus_points:
-                        st.markdown(f"""
-                        <div class="card" style="border-left:4px solid {COLORS['accent']};">
-                            <div style="font-weight:700;color:{COLORS['text_dark']};margin-bottom:10px;text-transform:uppercase;letter-spacing:0.05em;font-size:0.85rem;">争议焦点</div>
-                            {"".join(f'<div style="font-size:0.85rem;color:#333;margin-bottom:6px;">{i+1}. {fp}</div>' for i, fp in enumerate(focus_points))}
-                        </div>
-                        """, unsafe_allow_html=True)
-
-                    # 庭审记录
-                    rounds = moot_r.get('rounds', [])
-                    if rounds:
-                        st.markdown(f"""
-                        <div style="font-size:1.1rem;font-weight:800;color:{COLORS['text_dark']};margin-bottom:12px;letter-spacing:-0.02em;">
-                            庭审记录（共{len(rounds)}轮发言）
-                        </div>
-                        """, unsafe_allow_html=True)
-
-                        for rnd in rounds:
-                            role = rnd.get('role', rnd.get('speaker', ''))
-                            role_name = rnd.get('role_name', role)
-                            step_name = rnd.get('step_name', '')
-                            content = rnd.get('content', '')
-
-                            if 'plaintiff' in str(role) or '原告' in str(role_name):
-                                role_type = "plaintiff"
-                            elif 'defendant' in str(role) or '被告' in str(role_name):
-                                role_type = "defendant"
-                            else:
-                                role_type = "judge"
-                            chat_bubble(role_name, step_name, content, role_type)
-
-                    # 法官评分
-                    judge_scores = moot_r.get('judge_scores', {})
-                    if judge_scores and judge_scores.get('plaintiff'):
-                        st.markdown(f"""
-                        <div style="font-size:1.1rem;font-weight:800;color:{COLORS['text_dark']};margin:16px 0 12px;letter-spacing:-0.02em;">
-                            法官评分对比
-                        </div>
-                        """, unsafe_allow_html=True)
-
-                        p_scores = judge_scores.get('plaintiff', {})
-                        d_scores = judge_scores.get('defendant', {})
-
-                        col_p, col_d = st.columns(2)
-                        with col_p:
-                            st.markdown(f"""
-                            <div style="border:1px solid {COLORS['primary']};border-left:3px solid {COLORS['primary']};padding:10px 16px;margin-bottom:12px;">
-                                <div style="font-weight:700;color:{COLORS['primary']};font-size:0.8rem;text-transform:uppercase;letter-spacing:0.05em;">原告论证强度</div>
-                            </div>
-                            """, unsafe_allow_html=True)
-                            label_map = {"rights":"权利基础","infringement":"侵权认定","evidence":"证据体系","legal_application":"法律适用","claim_reasonableness":"诉求合理性"}
-                            for k, v in p_scores.items():
-                                score_bar(label_map.get(k, k), v, COLORS["primary"])
-
-                        with col_d:
-                            st.markdown(f"""
-                            <div style="border:1px solid {COLORS['danger']};border-left:3px solid {COLORS['danger']};padding:10px 16px;margin-bottom:12px;">
-                                <div style="font-weight:700;color:{COLORS['danger']};font-size:0.8rem;text-transform:uppercase;letter-spacing:0.05em;">被告抗辩强度</div>
-                            </div>
-                            """, unsafe_allow_html=True)
-                            d_label_map = {"fact_defense":"事实抗辩","legal_defense":"法律抗辩","evidence_challenge":"证据质疑","alternative_explanation":"替代解释","procedural_defense":"程序抗辩"}
-                            for k, v in d_scores.items():
-                                score_bar(d_label_map.get(k, k), v, COLORS["danger"])
-
-                        reasoning = judge_scores.get('coefficient_reasoning', '')
-                        if reasoning:
-                            st.info(f"**修正系数推理**: {reasoning}")
-
-                    # 薄弱环节
-                    weak_points = moot_r.get('weak_points', [])
-                    if weak_points:
-                        st.markdown(f"""
-                        <div class="card" style="border-left:4px solid {COLORS['danger']};">
-                            <div style="font-weight:700;color:{COLORS['text_dark']};margin-bottom:10px;text-transform:uppercase;letter-spacing:0.05em;font-size:0.85rem;">对抗暴露的薄弱环节</div>
-                            {"".join(f'<div style="font-size:0.85rem;color:#333;margin-bottom:6px;">— {wp}</div>' for wp in weak_points)}
-                        </div>
-                        """, unsafe_allow_html=True)
-
-                    st.caption(f"维度一 法律可行性综合得分: {legal_s} 分（权利 × 侵权 × 程序 × 对抗修正 {coeff:.2f}）")
-
-                    # 北大法宝抗辩类案
-                    with st.expander("📚 北大法宝 · 抗辩模式类案（被告常用抗辩）", expanded=True):
-                        with st.spinner("实时调用北大法宝..."):
-                            try:
-                                pkulaw_data = search_for_moot_court()
-                                st.caption(f"**检索摘要**: {pkulaw_data.get('_summary','')}")
-                                for c in pkulaw_data.get("cases", [])[:5]:
-                                    st.markdown(f"⚖️ **{c.get('title','?')}**")
-                                    meta = " · ".join([x for x in [c.get('court',''), c.get('date','')] if x])
-                                    if meta: st.caption(meta)
-                                    if c.get('summary'): st.caption(c['summary'][:200])
-                            except Exception as e:
-                                st.error(f"检索失败: {e}")
-
-            # ── Tab 5: 业务预期 ──
-            with tab_biz:
-                section_banner("维度二：业务预期", f"目标：{case.goal_type} · 回答「值不值得诉」", COLORS["warning"])
-
-                fin_score = fin_r.get('score', 50)
-                de = fin_r.get('damages_estimate', {})
-                te = fin_r.get('time_estimate', {})
-                fin_extra = []
-                if de:
-                    fin_extra.append(f"判赔预测: P10=¥{de.get('p10','-')} / P50=¥{de.get('p50','-')} / P90=¥{de.get('p90','-')}")
-                fin_extra.append(f"预估成本: ¥{fin_r.get('cost_estimate','-')}")
-                if te:
-                    fin_extra.append(f"时间: 一审{te.get('first_instance_months','-')}月 + 二审{te.get('second_instance_months','-')}月 + 执行{te.get('enforcement_months','-')}月")
-                fin_extra.append(f"回款概率: {fin_r.get('recovery_probability','-')}%")
-                dim_card("2.1 财务回报评估", fin_score, fin_r.get('analysis', ''), extra="\n".join(fin_extra))
-
-                # ── 企查查 · 被告财务画像 ──
-                qcc_d = eval_data.get("qcc_data", {})
-                if qcc_d and qcc_d.get("stages"):
-                    with st.expander("🏢 企查查 · 被告财务画像（实测数据）", expanded=False):
-                        st.caption(qcc_d.get("_summary", ""))
-                        metrics = qcc_d.get("metrics", {})
-                        if metrics:
-                            cols = st.columns(3)
-                            cols[0].metric("回款概率", f"{metrics.get('recovery_probability', '-')}%")
-                            cols[1].metric("判赔方向", metrics.get('damages_adjustment', '-'))
-                            cols[2].metric("时间延长", f"+{metrics.get('time_extra_months', 0)}月")
-                            reds = metrics.get("red_flags", [])
-                            greens = metrics.get("green_flags", [])
-                            if reds:
-                                st.error("🚨 " + " | ".join(reds[:5]))
-                            if greens:
-                                st.success("✅ " + " | ".join(greens[:5]))
-
-                        # 阶段 D 风险明细
-                        d_stage = qcc_d.get("stages", {}).get("D_风险下钻", {})
-                        if d_stage:
-                            risk_lines = []
-                            for label in ("失信信息", "被执行人", "终本案件", "限高消费", "经营异常", "严重违法",
-                                          "股权冻结", "动产抵押", "土地抵押", "司法拍卖", "欠税公告", "税收违法"):
-                                row = d_stage.get(label, {})
-                                if isinstance(row, dict) and row.get("_summary"):
-                                    risk_lines.append(f"- {label}: {row['_summary']}")
-                            if risk_lines:
-                                st.caption("**风险明细**")
-                                st.text("\n".join(risk_lines))
-
-                        # 阶段 F 经营规模
-                        f_stage = qcc_d.get("stages", {}).get("F_经营规模", {})
-                        if f_stage:
-                            ch_lines = []
-                            for label in ("商标资产", "线上店铺", "APP信息", "小程序", "微信公众号", "抖音账号",
-                                          "招投标", "融资记录", "荣誉信息", "榜单排名", "招聘信息"):
-                                row = f_stage.get(label, {})
-                                if isinstance(row, dict):
-                                    ch_lines.append(f"- {label}: {row.get('_summary', '')}")
-                            if ch_lines:
-                                st.caption("**经营规模与侵权渠道**")
-                                st.text("\n".join(ch_lines))
-
-                # 北大法宝判赔数据
-                with st.expander("📚 北大法宝 · 判赔数据类案（参考同案判赔区间）", expanded=True):
-                    with st.spinner("实时调用北大法宝..."):
-                        try:
-                            pkulaw_data = search_for_financial()
-                            st.caption(f"**检索摘要**: {pkulaw_data.get('_summary','')}")
-                            for c in pkulaw_data.get("cases", [])[:5]:
-                                st.markdown(f"💰 **{c.get('title','?')}**")
-                                meta = " · ".join([x for x in [c.get('court',''), c.get('date','')] if x])
-                                if meta: st.caption(meta)
-                                if c.get('summary'): st.caption(c['summary'][:200])
-                        except Exception as e:
-                            st.error(f"检索失败: {e}")
-
-                prec_score = prec_r.get('score', 50)
-                dim_card("2.2 判例价值评估", prec_score, prec_r.get('analysis', ''),
-                         extra=f"首案指数: {prec_r.get('first_case_index','-')} | 影响力级别: {prec_r.get('influence_level','-')}")
-
-                with st.expander("📚 北大法宝 · 首案检索（判例价值主力引擎）", expanded=True):
-                    with st.spinner("实时调用北大法宝..."):
-                        try:
-                            pkulaw_data = search_for_precedent(case.case_description)
-                            st.caption(f"**检索摘要**: {pkulaw_data.get('_summary','')}")
-                            for c in pkulaw_data.get("cases", [])[:8]:
-                                st.markdown(f"⚖️ **{c.get('title','?')}**")
-                                meta = " · ".join([x for x in [c.get('court',''), c.get('date','')] if x])
-                                if meta: st.caption(meta)
-                                if c.get('summary'): st.caption(c['summary'][:200])
-                        except Exception as e:
-                            st.error(f"检索失败: {e}")
-
-                st.success(f"维度二 业务预期综合得分: {biz_s} 分")
-                if case.goal_type == "要钱":
-                    st.caption(f"公式: 0.9×财务({fin_score}) + 0.1×判例({prec_score}) = {biz_s}")
-                else:
-                    st.caption(f"公式: 0.1×财务({fin_score}) + 0.9×判例({prec_score}) = {biz_s}")
-
-            # ── Tab 6: 证据就绪度 ──
-            with tab_evid:
-                section_banner("维度三：证据就绪度", "回答「现在能不能诉」", COLORS["success"])
-
-                ev_items = [{"name": m['requirement'], "status": m.get('status','不足'), "detail": m.get('analysis','')} for m in evid_r.get('evidence_matrix', [])]
-                dim_card("证据就绪度评估", evid_r.get('score', 60), evid_r.get('analysis', ''),
-                         sub_items=ev_items,
-                         extra="补证建议: " + ("; ".join(evid_r.get('remediation_suggestions', ['无']))) + "\n\n取证技术建议: " + evid_r.get('collection_advice', '根据证据类型自行判断'))
-
-                st.success(f"维度三 证据就绪度得分: {evid_s} 分")
-
-            # ── Tab 7: 综合评分 ──
-            with tab_final:
-                rec_color = {"green": COLORS["success"], "yellow": COLORS["warning"], "red": COLORS["danger"], "block": COLORS["danger"]}.get(rec_data['level'], COLORS["success"])
-                final_score_card(final_s, rec_data['recommendation'], rec_data['reason'], rec_color)
-
-                col_bars, col_radar = st.columns([1, 1])
-                with col_bars:
-                    st.markdown("##### 各维度得分")
-                    score_bar("法律可行性", legal_s, COLORS["primary"], "权利 × 侵权 × 程序 × 对抗修正")
-                    score_bar("业务预期", biz_s, COLORS["warning"], "要钱/要名自适应加权")
-                    score_bar("证据就绪度", evid_s, COLORS["success"], "证据完整性与补证")
-                    st.markdown(f"**乘法模型**: {legal_s} × {biz_s} × {evid_s} = **{final_s}**")
-                    st.caption(f"对抗修正系数: {coeff:.2f} · 一票否决逻辑")
-
-                with col_radar:
-                    st.markdown("##### 三维雷达图")
-                    radar_html = render_radar_html({
-                        "法律可行性": legal_s,
-                        "业务预期": biz_s,
-                        "证据就绪度": evid_s
-                    })
-                    st.markdown(radar_html, unsafe_allow_html=True)
-
-                # 北大法宝验证
-                with st.expander("北大法宝 · 法条与案号验证"):
-                    valid_status = get_validation_status(case_id)
-                    col_v1, col_v2, col_v3 = st.columns(3)
-                    with col_v1:
-                        metric_card("法条验证", "通过" if valid_status["provisions_validated"] else "待验证", "")
-                    with col_v2:
-                        metric_card("法规识别", "通过" if valid_status["laws_validated"] else "待验证", "")
-                    with col_v3:
-                        metric_card("案号识别", "通过" if valid_status["cases_validated"] else "待验证", "")
-                    if not all([valid_status["provisions_validated"], valid_status["laws_validated"], valid_status["cases_validated"]]):
-                        st.warning("评估完成后，请让 AI 助手运行北大法宝验证，确保法条和案号引用真实有效")
-
-                st.info("评估报告已生成，前往「评估报告」页面查看和下载完整报告。")
-
+            progress.progress(100, "评估完成")
+            if integrity.get("is_complete"):
+                accent_notice("评估完成，结果页将继续展示本次缓存结果。")
+            else:
+                accent_notice("评估已结束，但存在未完成关键维度；系统未输出完整综合结论。")
+            accent_notice("评估报告已生成，请切换到「评估报告」标签页查看完整报告。")
+            st.rerun()        # ════════════════════════════════════════════════════
     finally:
         db.close()
 
-
-# ============================================================
-# 页面 4: 模拟法庭
 # ============================================================
 elif page == "模拟法庭":
-    page_header("模拟法庭", "多Agent对抗式庭审 · 原告Agent ↔ 被告Agent ↔ 法官Agent")
+    page_header("模拟法庭", "固定脚本庭审复现 · 查看已完成评估案件的庭审记录与法官归纳")
 
     if "current_case_id" not in st.session_state:
-        st.warning("请先在「案件列表」中选择一个案件")
+        empty_state_notice("请先在「案件列表」中选择一个案件")
         st.stop()
 
     case_id = st.session_state["current_case_id"]
@@ -1253,41 +2185,28 @@ elif page == "模拟法庭":
         <div class="card" style="border-left:4px solid {COLORS['accent']};">
             <div style="font-size:1.05rem;font-weight:700;color:{COLORS['text_dark']};letter-spacing:-0.01em;">{case_name}</div>
             <div style="font-size:0.78rem;color:{COLORS['text_muted']};margin-top:4px;">
-                ID: {case_id} | 案由: {case.cause_type} | 模式: {'Mock 模拟' if _mock else 'DeepSeek API'}
+                ID: {case_id} | 案由: {case.cause_type} | 模式: {'Mock 模拟' if _use_mock_mode() else 'DeepSeek API'}
             </div>
         </div>
         """, unsafe_allow_html=True)
 
+        eval_key = f"eval_results_{case_id}"
+        eval_data = st.session_state.get(eval_key) or _load_eval_cache(case_id) or {}
+        if eval_data and eval_key not in st.session_state:
+            st.session_state[eval_key] = eval_data
+
         moot_key = f"moot_{case_id}"
-        moot_result = st.session_state.get(moot_key)
+        moot_result = (eval_data.get("moot") if isinstance(eval_data, dict) else None) or st.session_state.get(moot_key)
 
-        # 操作区
-        col_run, col_info = st.columns([1, 2])
-        with col_run:
-            if st.button("开始模拟法庭", type="primary", use_container_width=True):
-                rights_text = str(st.session_state.get(f"rights_{case_id}", {}).get('analysis', ''))
-                inf_text = str(st.session_state.get(f"infringement_{case_id}", {}).get('analysis', ''))
-                evidence_texts = st.session_state.get("evidence_text_extra", "")
-
-                progress = st.progress(0, "正在启动模拟法庭...")
-                with st.spinner("正在运行五步庭审模拟，预计需要 1-2 分钟..."):
-                    moot_result = run_moot_court_simulation(
-                        case.case_description,
-                        rights_assessment=rights_text,
-                        infringement_assessment=inf_text,
-                        evidence_summary=evidence_texts[:1500] if evidence_texts else ""
-                    )
-                    st.session_state[moot_key] = moot_result
-                progress.progress(100, "模拟法庭完成！")
-                st.rerun()
-
-        with col_info:
-            if moot_result:
-                coeff = moot_result.get('correction_coefficient', 1.0)
-                ds = moot_result.get('defense_strength', 50)
-                st.success(f"已完成 | 修正系数: **{coeff:.2f}** | 抗辩强度: **{ds}/100**")
-            else:
-                st.info("点击左侧按钮启动模拟法庭。需要先完成「评估分析」以获取权利基础和侵权认定结果。")
+        if moot_result and moot_result.get("rounds"):
+            coeff = moot_result.get("correction_coefficient", 1.0)
+            ds = moot_result.get("defense_strength", 50)
+            accent_notice(f"已生成庭审复现报告 | 修正系数: {coeff:.2f} | 抗辩强度: {ds}/100")
+            st.caption("本页仅复现已完成评估案件的模拟法庭结果，不再单独启动一次模拟法庭。")
+        elif moot_result and moot_result.get("error"):
+            accent_notice(f"当前案件的模拟法庭结果未完整生成：{moot_result.get('error', '未知错误')}")
+        else:
+            empty_state_notice("当前案件尚未生成模拟法庭复现结果。请先在「评估分析」中完成整案评估，系统会自动生成并缓存模拟法庭报告。")
 
         st.markdown("")
 
@@ -1313,20 +2232,27 @@ elif page == "模拟法庭":
 
             # 庭审步骤进度条
             step_names = ["开庭陈述", "被告答辩", "举证质证", "法庭辩论", "法官归纳"]
-            step_nums = [1, 2, 3, 4, 5]
-            st.markdown(f"""
-            <div style="margin:20px 0;padding:16px 0;border-top:1px solid #e5e5e5;border-bottom:1px solid #e5e5e5;">
-                <div style="display:flex;justify-content:space-between;align-items:center;">
-                    {"".join(f'''
-                    <div style="flex:1;text-align:center;position:relative;">
-                        <div style="width:32px;height:32px;border:2px solid {'#0d1429' if i < len(rounds) else '#e5e5e5'};border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font-size:0.8rem;font-weight:700;color:{'#0d1429' if i < len(rounds) else '#ccc'};background:{'#0d1429' if i < len(rounds) else 'transparent'};">{f'<span style="color:#fff;">{i+1}</span>' if i < len(rounds) else i+1}</div>
-                        <div style="font-size:0.72rem;color:{'#0d1429' if i < len(rounds) else '#ccc'};margin-top:6px;font-weight:{'600' if i < len(rounds) else '400'};">{s}</div>
-                    </div>{'<div style="flex:0.3;height:2px;background:#0d1429;"></div>' if i < 4 else ''}
-                    ''' for i, s in enumerate(step_names))}
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-
+            progress_segments = []
+            for i, step_name in enumerate(step_names):
+                completed = i < len(rounds)
+                border_color = "#0d1429" if completed else "#e5e5e5"
+                text_color = "#0d1429" if completed else "#cccccc"
+                fill_color = "#0d1429" if completed else "transparent"
+                step_weight = "600" if completed else "400"
+                step_index_html = f'<span style="color:#fff;">{i + 1}</span>' if completed else str(i + 1)
+                progress_segments.append(
+                    f'<div style="flex:1;text-align:center;position:relative;">'
+                    f'<div style="width:32px;height:32px;border:2px solid {border_color};border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font-size:0.8rem;font-weight:700;color:{text_color};background:{fill_color};">{step_index_html}</div>'
+                    f'<div style="font-size:0.72rem;color:{text_color};margin-top:6px;font-weight:{step_weight};">{step_name}</div>'
+                    "</div>"
+                )
+                if i < len(step_names) - 1:
+                    connector_color = "#0d1429" if completed else "#e5e5e5"
+                    progress_segments.append(f'<div style="flex:0.3;height:2px;background:{connector_color};"></div>')
+            st.markdown(
+                f'<div style="margin:20px 0;padding:16px 0;border-top:1px solid #e5e5e5;border-bottom:1px solid #e5e5e5;"><div style="display:flex;justify-content:space-between;align-items:center;">{"".join(progress_segments)}</div></div>',
+                unsafe_allow_html=True,
+            )
             # 争议焦点
             focus_points = moot_result.get('focus_points', [])
             if focus_points:
@@ -1425,7 +2351,7 @@ elif page == "模拟法庭":
 
                 reasoning = judge_scores.get('coefficient_reasoning', '')
                 if reasoning:
-                    st.info(f"**修正系数推理**: {reasoning}")
+                    accent_notice(f"<strong>修正系数推理：</strong>{reasoning}")
 
             # 薄弱环节
             weak_points = moot_result.get('weak_points', [])
@@ -1451,7 +2377,7 @@ elif page == "评估报告":
     page_header("评估报告", "三维评分总览 · 可下载总结文档")
 
     if "current_case_id" not in st.session_state:
-        st.warning("请先在「案件列表」中选择一个已评估的案件")
+        empty_state_notice("请先在「案件列表」中选择一个已评估的案件")
         st.stop()
 
     case_id = st.session_state["current_case_id"]
@@ -1468,12 +2394,25 @@ elif page == "评估报告":
         report = db.query(Report).filter(Report.case_id == case_id).order_by(Report.id.desc()).first()
 
         if not score:
-            st.warning("该案件尚未评估，请先进行评估")
+            empty_state_notice("该案件尚未评估，请先进行评估")
             st.stop()
 
+        report_eval_data = st.session_state.get(f"eval_results_{case_id}") or _load_eval_cache(case_id) or {}
+        integrity_info = report_eval_data.get("integrity", {
+            "is_complete": score.final_score is not None,
+            "label": "完整" if score.final_score is not None else "部分完成",
+            "critical_issues": [],
+            "optional_issues": [],
+        })
+        report_content = report.markdown_content if report else report_eval_data.get("report_markdown", "")
+        legal_score_value = int(score.legal_score or 0)
+        business_score_value = int(score.business_score or 0)
+        evidence_score_value = int(score.evidence_score or 0)
+        final_score_display = "未生成" if score.final_score is None else str(score.final_score)
+        final_score_suffix = "" if score.final_score is None else "/100"
+
         # 顶部摘要
-        rec_color = {"建议起诉": COLORS["success"], "补证后再起诉": COLORS["warning"],
-                     "暂不建议起诉": COLORS["danger"], "暂缓起诉": COLORS["danger"]}.get(score.recommendation, COLORS["primary"])
+        rec_color = {"建议起诉": COLORS["success"], "补证后起诉": COLORS["warning"], "评估未完成": COLORS["warning"], "暂不建议起诉": COLORS["danger"], "暂缓起诉": COLORS["danger"]}.get(score.recommendation, COLORS["primary"])
 
         st.markdown(f"""
         <div class="card" style="border-left:6px solid {rec_color};">
@@ -1481,8 +2420,8 @@ elif page == "评估报告":
             <div style="font-size:1.5rem;font-weight:800;color:{COLORS['text_dark']};letter-spacing:-0.02em;">{case.name}</div>
             <div style="margin-top:16px;display:flex;gap:40px;flex-wrap:wrap;">
                 <div><span style="font-size:0.7rem;color:{COLORS['text_muted']};text-transform:uppercase;letter-spacing:0.05em;">综合评分</span><br>
-                     <span style="font-size:3rem;font-weight:800;color:{rec_color};letter-spacing:-0.04em;">{score.final_score}</span>
-                     <span style="color:{COLORS['text_muted']};font-size:0.9rem;">/100</span></div>
+                     <span style="font-size:3rem;font-weight:800;color:{rec_color};letter-spacing:-0.04em;">{final_score_display}</span>
+                     <span style="color:{COLORS['text_muted']};font-size:0.9rem;">{final_score_suffix}</span></div>
                 <div><span style="font-size:0.7rem;color:{COLORS['text_muted']};text-transform:uppercase;letter-spacing:0.05em;">建议</span><br>
                      <span style="font-size:1.2rem;font-weight:700;color:{rec_color};">{score.recommendation}</span></div>
                 <div><span style="font-size:0.7rem;color:{COLORS['text_muted']};text-transform:uppercase;letter-spacing:0.05em;">置信度</span><br>
@@ -1496,37 +2435,37 @@ elif page == "评估报告":
         with col_chart:
             st.markdown("##### 三维评分雷达图")
             radar_html = render_radar_html({
-                "法律可行性": int(score.legal_score),
-                "业务预期": int(score.business_score),
-                "证据就绪度": int(score.evidence_score)
+                "法律可行性": legal_score_value,
+                "业务预期": business_score_value,
+                "证据就绪度": evidence_score_value
             })
             st.markdown(radar_html, unsafe_allow_html=True)
 
         with col_bars:
             st.markdown("##### 各维度得分详情")
-            score_bar("法律可行性", int(score.legal_score), COLORS["primary"], "权利 × 侵权 × 程序 × 对抗修正")
-            score_bar("业务预期", int(score.business_score), COLORS["warning"], "要钱/要名自适应加权")
-            score_bar("证据就绪度", int(score.evidence_score), COLORS["success"], "证据完整性与补证")
+            score_bar("法律可行性", legal_score_value, COLORS["primary"], "权利 × 侵权 × 程序 × 对抗修正")
+            score_bar("业务预期", business_score_value, COLORS["warning"], "要钱/要名自适应加权")
+            score_bar("证据就绪度", evidence_score_value, COLORS["success"], "证据完整性与补证")
             st.divider()
-            st.markdown(f"**乘法模型**: {int(score.legal_score)} × {int(score.business_score)} × {int(score.evidence_score)} = **{score.final_score}**")
+            st.markdown(f"**乘法模型**: {legal_score_value} × {business_score_value} × {evidence_score_value} = **{final_score_display}**")
             st.caption(f"置信度: {score.confidence_score}% · 一票否决逻辑")
 
         # 完整报告
         st.markdown("---")
         st.markdown("##### 完整评估报告")
-        if report:
-            st.markdown(report.markdown_content)
+        if report_content:
+            st.markdown(report_content)
         else:
-            st.info("报告内容未保存")
+            accent_notice("报告内容未保存")
 
         # 下载区域
         st.markdown("---")
         st.markdown("##### 📥 下载总结文档")
 
         radar_svg_str = render_radar_svg({
-            "法律可行性": int(score.legal_score),
-            "业务预期": int(score.business_score),
-            "证据就绪度": int(score.evidence_score)
+            "法律可行性": legal_score_value,
+            "业务预期": business_score_value,
+            "证据就绪度": evidence_score_value
         })
 
         summary_html = f"""<!DOCTYPE html>
@@ -1547,7 +2486,7 @@ th{{background:#f8f9fa}}
 <p><strong>案件名称:</strong> {case.name} &nbsp;|&nbsp; <strong>案由:</strong> {case.cause_type} &nbsp;|&nbsp; <strong>评估日期:</strong> {datetime.now().strftime('%Y-%m-%d')}</p>
 
 <h2>一、结论摘要</h2>
-<div class="score-big">{score.final_score} / 100</div>
+<div class="score-big">{final_score_display}{" / 100" if final_score_suffix else ""}</div>
 <div class="rec">{score.recommendation}</div>
 
 <h2>二、三维评分总览</h2>
@@ -1557,7 +2496,7 @@ th{{background:#f8f9fa}}
 <tr><td>法律可行性</td><td>{score.legal_score}/100</td><td>权利 × 侵权 × 程序 × 对抗修正</td></tr>
 <tr><td>业务预期</td><td>{score.business_score}/100</td><td>要钱/要名自适应加权</td></tr>
 <tr><td>证据就绪度</td><td>{score.evidence_score}/100</td><td>证据完整性与补证</td></tr>
-<tr><td><strong>综合得分（乘法模型）</strong></td><td><strong>{score.final_score}/100</strong></td><td>一票否决逻辑</td></tr>
+<tr><td><strong>综合得分（乘法模型）</strong></td><td><strong>{final_score_display}{final_score_suffix}</strong></td><td>一票否决逻辑</td></tr>
 </table>
 
 <h2>三、评估说明</h2>
@@ -1581,7 +2520,7 @@ th{{background:#f8f9fa}}
 
         pdf_bytes = None
         try:
-            pdf_bytes = generate_pdf_bytes(report.markdown_content if report else summary_html)
+            pdf_bytes = generate_pdf_bytes(report_content if report_content else summary_html)
         except Exception as e:
             st.caption(f"PDF 生成失败: {e}")
 
@@ -1609,6 +2548,162 @@ th{{background:#f8f9fa}}
 
     finally:
         db.close()
+
+
+# ============================================================
+# 页面 6: 系统配置
+# ============================================================
+elif page == "系统配置":
+    page_header("系统配置", "运行模式与外部服务参数管理")
+
+    current_settings = get_runtime_settings()
+    current_status = get_runtime_configuration_status()
+    saved_mode_label = "Mock 模拟模式" if current_settings["use_mock"] else "真实 Demo 模式"
+    mode_options = ["Mock 模拟模式", "真实 Demo 模式"]
+    if st.session_state.get("system_config_mode_saved") != saved_mode_label:
+        st.session_state["system_config_mode_preview"] = saved_mode_label
+        st.session_state["system_config_mode_saved"] = saved_mode_label
+    preview_mode_label = st.session_state.get("system_config_mode_preview", saved_mode_label)
+    is_mock_mode = preview_mode_label == "Mock 模拟模式"
+
+    st.markdown(f"""
+    <div class="card" style="border-left:4px solid {COLORS['accent']};">
+        <div style="font-size:1.05rem;font-weight:700;color:{COLORS['primary']};">本地配置中心</div>
+        <div style="font-size:0.88rem;color:{COLORS['text_body']};margin-top:10px;line-height:1.8;">
+            系统配置页用于维护当前机器上的运行参数。配置会写入本地 <code>.env</code> 文件，不会提交到仓库，也不会在页面中回显凭证明文。
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    col_form, col_status = st.columns([1.2, 0.8], gap="large")
+
+    with col_form:
+        form_section_title("运行配置")
+        st.radio(
+            "运行模式",
+            mode_options,
+            key="system_config_mode_preview",
+            horizontal=True,
+        )
+        preview_mode_label = st.session_state.get("system_config_mode_preview", saved_mode_label)
+        is_mock_mode = preview_mode_label == "Mock 模拟模式"
+
+        with st.form("system_config_form"):
+            st.markdown("**模型提供方**")
+            st.caption("DeepSeek（固定，不可更换）")
+            base_url = st.text_input(
+                "DeepSeek Base URL",
+                value=current_settings["deepseek_base_url"],
+                placeholder="https://api.deepseek.com",
+                disabled=is_mock_mode,
+            )
+            if is_mock_mode:
+                st.caption("当前为 Mock 模式，真实服务配置已锁定。")
+            else:
+                st.caption("DeepSeek API Key：已配置。留空保存会保留现有 Key。" if current_status["api_key_configured"] else "DeepSeek API Key：未配置。")
+            api_key_input = st.text_input(
+                "DeepSeek API Key",
+                value="",
+                type="password",
+                placeholder="留空则保留现有 API Key" if not is_mock_mode else "Mock 模式下无需填写",
+                disabled=is_mock_mode,
+            )
+            clear_api_key = st.checkbox("保存时清空当前 DeepSeek API Key", disabled=is_mock_mode)
+
+            st.markdown("**外部检索服务**")
+            st.caption("企查查 Token：已配置。留空保存会保留现有 Token。" if current_status["qcc_api_token_configured"] else "企查查 Token：未配置。")
+            qcc_api_token_input = st.text_input(
+                "企查查 Token",
+                value="",
+                type="password",
+                placeholder="留空则保留现有企查查 Token" if not is_mock_mode else "Mock 模式下无需填写",
+                disabled=is_mock_mode,
+            )
+            clear_qcc_api_token = st.checkbox("保存时清空当前企查查 Token", disabled=is_mock_mode)
+
+            st.caption("北大法宝 Token：已配置。留空保存会保留现有 Token。" if current_status["pkulaw_api_token_configured"] else "北大法宝 Token：未配置。")
+            pkulaw_api_token_input = st.text_input(
+                "北大法宝 Token",
+                value="",
+                type="password",
+                placeholder="留空则保留现有北大法宝 Token" if not is_mock_mode else "Mock 模式下无需填写",
+                disabled=is_mock_mode,
+            )
+            clear_pkulaw_api_token = st.checkbox("保存时清空当前北大法宝 Token", disabled=is_mock_mode)
+            submitted = st.form_submit_button("保存配置", type="primary", use_container_width=True)
+
+        if submitted:
+            validation_errors = []
+            if clear_api_key and api_key_input.strip():
+                validation_errors.append("已勾选清空 DeepSeek API Key 时，请不要同时输入新的 Key。")
+            if clear_qcc_api_token and qcc_api_token_input.strip():
+                validation_errors.append("已勾选清空企查查 Token 时，请不要同时输入新的 Token。")
+            if clear_pkulaw_api_token and pkulaw_api_token_input.strip():
+                validation_errors.append("已勾选清空北大法宝 Token 时，请不要同时输入新的 Token。")
+
+            if validation_errors:
+                for message in validation_errors:
+                    st.error(message)
+            else:
+                final_api_key = "" if clear_api_key else (api_key_input.strip() or current_settings["deepseek_api_key"])
+                final_qcc_api_token = "" if clear_qcc_api_token else (qcc_api_token_input.strip() or current_settings["qcc_api_token"])
+                final_pkulaw_api_token = "" if clear_pkulaw_api_token else (pkulaw_api_token_input.strip() or current_settings["pkulaw_api_token"])
+                save_runtime_settings(
+                    use_mock=(preview_mode_label == "Mock 模拟模式"),
+                    llm_provider="deepseek",
+                    deepseek_api_key=final_api_key,
+                    deepseek_base_url=base_url.strip() or "https://api.deepseek.com",
+                    qcc_api_token=final_qcc_api_token,
+                    pkulaw_api_token=final_pkulaw_api_token,
+                )
+                accent_notice("系统配置已保存。当前页面会立即按新配置重新加载。")
+                st.rerun()
+
+    with col_status:
+        form_section_title("当前状态")
+        metric_cols = st.columns(2)
+        with metric_cols[0]:
+            metric_card("运行模式", current_status["mode_label"], "")
+        with metric_cols[1]:
+            metric_card("配置状态", "就绪" if current_status["ready"] else "待补充", "")
+
+        service_cols_top = st.columns(2)
+        with service_cols_top[0]:
+            metric_card("DeepSeek", "已配置" if current_status["api_key_configured"] else "未配置", "")
+        with service_cols_top[1]:
+            metric_card("企查查", "已配置" if current_status["qcc_api_token_configured"] else "未配置", "")
+        service_cols_bottom = st.columns(2)
+        with service_cols_bottom[0]:
+            metric_card("北大法宝", "已配置" if current_status["pkulaw_api_token_configured"] else "未配置", "")
+
+        if not current_status["ready"]:
+            empty_state_notice("真实 Demo 模式下需要先配置 DeepSeek API Key，保存后即可发起真实评估。")
+
+        if current_status.get("storage_notice"):
+            accent_notice(current_status["storage_notice"])
+
+        for warning in current_status["optional_warnings"]:
+            accent_notice(warning)
+
+        st.caption(f"用户数据目录：{current_status['preferred_user_data_dir']}")
+        st.caption(f"安装目录：{current_status['install_dir']}")
+        st.caption(f"当前实际生效目录：{current_status['user_data_dir']}")
+        st.caption("配置文件、数据库、缓存都会写入当前实际生效目录。")
+
+        test_disabled = current_settings["use_mock"] or not current_status["api_key_configured"]
+        if current_settings["use_mock"]:
+            test_help = "Mock 模式下不调用真实 DeepSeek，无法测试连接。"
+        elif not current_status["api_key_configured"]:
+            test_help = "请先保存 DeepSeek API Key，再测试连接。"
+        else:
+            test_help = "测试当前已保存的 DeepSeek 配置是否可用。"
+        with st.container(key="system_config_status_actions"):
+            if st.button("测试 DeepSeek 连接", use_container_width=True, disabled=test_disabled, help=test_help):
+                with st.spinner("正在测试 DeepSeek API 连接..."):
+                    if llm_client.check_api_connection():
+                        accent_notice("连接成功，真实 Demo 模式已可用。")
+                    else:
+                        st.error("连接失败。请检查 API Key、Base URL 或网络环境。")
 
 
 # ============================================================
@@ -1662,3 +2757,8 @@ elif page == "关于":
         <strong>免责声明</strong> · 本系统为 AI 辅助决策工具，评估结果仅供内部参考，不构成正式法律意见。
     </div>
     """, unsafe_allow_html=True)
+
+
+
+
+

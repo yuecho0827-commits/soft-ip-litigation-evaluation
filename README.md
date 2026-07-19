@@ -1,143 +1,73 @@
 # Soft IP 主诉评估系统
 
-MVP 版本 - 商标侵权案件诉前评估工具
+商标侵权案件诉前评估 Demo。当前版本默认以真实 Demo 模式运行，Mock 仅作为开发调试兜底。
 
 ## 快速启动
 
-### 1. 安装依赖
+### Windows
 
-```bash
-cd soft-ip-evaluation
-pip install -r requirements.txt
+```powershell
+cd soft-ip-litigation-evaluation
+copy .env.example .env
+./start.ps1
 ```
 
-### 2. 配置环境变量
-
-复制 `.env.example` 为 `.env`：
+### macOS / Linux
 
 ```bash
+cd soft-ip-litigation-evaluation
 cp .env.example .env
+bash start.sh
 ```
 
-**Mock 模式（推荐先使用）**：
-```
-USE_MOCK=True
-```
-→ 使用模拟数据，无需 API key
+## 运行模式
 
-**生产模式（接入 DeepSeek API）**：
-```
+### 真实 Demo 模式（默认）
+
+```env
 USE_MOCK=False
 DEEPSEEK_API_KEY=your_real_api_key
+QCC_API_TOKEN=your_qcc_token
+PKULAW_API_TOKEN=your_pkulaw_token
 ```
 
-### 3. 启动应用
+特性：
+- 评估页会明确区分“已完成”和“部分完成”。
+- 结果页默认只展示缓存检索结果，不自动重复调用北大法宝/企查查。
+- 缺少 DeepSeek 必要配置时会在页面和侧边栏直接提示，并阻断真实评估。
+- 缺少企查查或北大法宝 Token 时，对应外部检索链路会自动跳过，并给出明确提示。
 
-```bash
-streamlit run app.py
+### Mock 模式（仅调试）
+
+```env
+USE_MOCK=True
 ```
 
-应用会自动在浏览器打开：`http://localhost:8501`
+特性：
+- 不调用真实外部检索。
+- 可完整跑通案件创建、评估、报告生成链路。
+- 仅用于开发演示，不代表真实检索或真实结论。
 
-## 使用流程
+## 本轮修复点
 
-1. **新建案件** (`📝 新建案件`)
-   - 填写案件名称、业务目标
-   - 描述案情（越详细越好）
-   - 点击"创建案件并开始评估"
+- 外部调用失败时改为失败态展示，不再静默落默认高分。
+- 综合评分和建议受数据完整性约束，关键维度缺失时显示“评估未完成”。
+- 北大法宝、企查查结果统一缓存，结果页默认读缓存，可手动“刷新外部检索”。
+- PDF 导出补充 Windows 中文字体兜底，并关闭 Streamlit usage stats。
+- 新增 `start.ps1`，适配 Windows 本地启动。
 
-2. **评估分析** (`🔍 评估分析`)
-   - 系统自动进行：
-     - ✅ 案情事实提取
-     - ✅ 红线风险检查（6 条规则）
-     - ✅ 法律要件分析
-     - ✅ 三维评分计算
-     - ✅ 评估报告生成
+## 常见路径
 
-3. **查看报告** (`📄 评估报告`)
-   - 查看完整评估报告
-   - 下载 Markdown 或 PDF 版本
+默认会优先写入当前用户的数据目录，而不是程序安装目录：
 
-## 项目结构
+- Windows：`%LOCALAPPDATA%\SoftIpLitigationEvaluation\`
+- 数据库：`runtime\soft_ip.db`
+- 评估缓存：`runtime\eval_results_<case_id>.json`
+- 检索缓存：`runtime\pkulaw_results_<case_id>.json`
+- 报告：`runtime\reports\`
 
-```
-soft-ip-evaluation/
-├── app.py                 # Streamlit 主程序
-├── config.py              # 配置文件
-├── database.py           # 数据库模型
-├── mock_llm.py          # Mock LLM 模块
-├── legal_rules.py        # 规则引擎
-├── scoring.py            # 评分逻辑
-├── report_generator.py   # 报告生成
-├── data/                 # 数据目录
-│   ├── soft_ip.db      # SQLite 数据库
-│   └── reports/         # 生成的报告
-├── requirements.txt       # Python 依赖
-├── .env.example         # 环境变量模板
-└── README.md           # 本文件
-```
+如果默认用户目录不可写，系统会自动回退到安装目录下的 `.user_data\`，并在系统配置页与侧边栏提示当前实际生效目录。
 
-## 技术栈
+## 免责声明
 
-- **前端**: Streamlit
-- **后端**: Python
-- **数据库**: SQLite + SQLAlchemy
-- **LLM**: DeepSeek API（可切换）
-- **报告**: Markdown + ReportLab (PDF)
-
-## MVP 功能范围
-
-### ✅ 已实现
-
-- [x] 商标侵权案件评估
-- [x] 案情事实提取（Mock）
-- [x] 红线风险检查（6 条规则）
-- [x] 法律要件分析
-- [x] 三维评分（法律 × 业务 × 证据）
-- [x] 评估报告生成（Markdown + PDF）
-- [x] 案件管理（创建、列表）
-
-### 🚧 后续规划
-
-- [ ] 接入真实 DeepSeek API
-- [ ] 证据文件上传与解析
-- [ ] 法律数据库对接（法规、案例）
-- [ ] 模拟法庭（多 Agent）
-- [ ] 著作权、不正当竞争案由扩展
-- [ ] 用户权限管理
-
-## 常见问题
-
-### Q: 运行报错 `ModuleNotFoundError`
-
-**A**: 请确保已安装依赖：
-
-```bash
-pip install -r requirements.txt
-```
-
-### Q: 如何切换到真实 LLM API？
-
-**A**: 修改 `.env` 文件：
-
-```
-USE_MOCK=False
-DEEPSEEK_API_KEY=your_api_key
-```
-
-### Q: 数据库文件在哪里？
-
-**A**: `data/soft_ip.db`（SQLite 文件）
-
-### Q: 如何查看评估报告？
-
-**A**: 评估完成后，前往「📄 评估报告」页面查看和下载
-
-## 联系方式
-
-- 产品: [你的名字]
-- 技术: [研发者名字]
-
----
-
-**免责声明**: 本系统为 AI 辅助工具，评估结果仅供内部决策参考，不构成正式法律意见。
+本系统为 AI 辅助评估工具，结果仅供内部决策参考，不构成正式法律意见。
