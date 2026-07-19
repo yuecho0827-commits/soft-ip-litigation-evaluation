@@ -2415,18 +2415,34 @@ elif page == "模拟法庭":
                     chat_bubble(role_name, step_name, content, role_type)
 
             # 法官归纳摘要 — 高亮显示（焦点章节）
+            structured = moot_result.get('summary_structured', {}) or {}
             judge_summary = moot_result.get('judge_summary', '')
-            if judge_summary:
+            if structured or judge_summary:
                 st.markdown("")
-                st.markdown(f"""
-                <div class="card" style="border:3px solid {COLORS['accent']};background:linear-gradient(135deg, #fffaf0 0%, #ffffff 100%);margin-top:24px;padding:18px 22px;">
-                    <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;">
-                        <span style="font-size:1.4rem;">⚖️</span>
-                        <span style="font-size:1.1rem;font-weight:800;color:{COLORS['accent']};letter-spacing:-0.01em;">法官最终判决</span>
+                # 优先展示结构化判决书
+                if structured:
+                    st.markdown(f"""
+                    <div class="card" style="border:3px solid {COLORS['accent']};background:linear-gradient(135deg, #fffaf0 0%, #ffffff 100%);margin-top:24px;padding:20px 24px;">
+                        <div style="display:flex;align-items:center;gap:8px;margin-bottom:16px;">
+                            <span style="font-size:1.4rem;">⚖️</span>
+                            <span style="font-size:1.15rem;font-weight:800;color:{COLORS['accent']};letter-spacing:-0.01em;">法官最终判决书</span>
+                        </div>
                     </div>
-                    <div style="font-size:0.95rem;color:#222;line-height:1.9;white-space:pre-wrap;">{judge_summary}</div>
-                </div>
-                """, unsafe_allow_html=True)
+                    """, unsafe_allow_html=True)
+                    for key in ("一、争议焦点归纳", "二、本院裁判理由", "三、裁判结论"):
+                        text = structured.get(key, "")
+                        if text:
+                            st.markdown(text)
+                elif judge_summary:
+                    st.markdown(f"""
+                    <div class="card" style="border:3px solid {COLORS['accent']};background:linear-gradient(135deg, #fffaf0 0%, #ffffff 100%);margin-top:24px;padding:18px 22px;">
+                        <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;">
+                            <span style="font-size:1.4rem;">⚖️</span>
+                            <span style="font-size:1.1rem;font-weight:800;color:{COLORS['accent']};letter-spacing:-0.01em;">法官最终判决</span>
+                        </div>
+                        <div style="font-size:0.95rem;color:#222;line-height:1.9;white-space:pre-wrap;">{judge_summary}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
 
             # 法官评分对比
             judge_scores = moot_result.get('judge_scores', {})

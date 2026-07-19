@@ -44,6 +44,7 @@ class MootCourtResult:
     correction_coefficient: float = 1.0
     defense_strength: int = 50
     judge_summary: str = ""
+    summary_structured: Dict[str, str] = field(default_factory=dict)
     weak_points: List[str] = field(default_factory=list)
     focus_points: List[str] = field(default_factory=list)
     judge_scores: Dict[str, Any] = field(default_factory=dict)
@@ -65,6 +66,7 @@ class MootCourtResult:
             "correction_coefficient": self.correction_coefficient,
             "defense_strength": self.defense_strength,
             "judge_summary": self.judge_summary,
+            "summary_structured": self.summary_structured,
             "weak_points": self.weak_points,
             "focus_points": self.focus_points,
             "judge_scores": self.judge_scores,
@@ -285,6 +287,7 @@ class MootCourtProcedure:
 
         result.defense_strength = int(judge_raw.get("defense_strength", 50))
         result.judge_summary = judge_raw.get("summary", "")
+        result.summary_structured = judge_raw.get("summary_structured", {}) or {}
         result.weak_points = judge_raw.get("weak_points", [])
         result.focus_points = judge_raw.get("focus_points", [])
         result.judge_scores = {
