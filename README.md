@@ -9,7 +9,14 @@
 ```powershell
 cd soft-ip-litigation-evaluation
 copy .env.example .env
-./start.ps1
+powershell -ExecutionPolicy Bypass -File .\start.ps1
+```
+
+如果当前 PowerShell 会话限制脚本执行，也可以先运行：
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\start.ps1
 ```
 
 ### macOS / Linux
@@ -71,3 +78,4 @@ USE_MOCK=True
 ## 免责声明
 
 本系统为 AI 辅助评估工具，结果仅供内部决策参考，不构成正式法律意见。
+
