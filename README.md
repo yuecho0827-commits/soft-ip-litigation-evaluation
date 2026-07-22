@@ -9,14 +9,21 @@
 ```powershell
 cd soft-ip-litigation-evaluation
 copy .env.example .env
-powershell -ExecutionPolicy Bypass -File .\start.ps1
+Unblock-File .\start.ps1
+.\start.ps1
 ```
 
-如果当前 PowerShell 会话限制脚本执行，也可以先运行：
+如果脚本是从浏览器下载或从压缩包解压出来的，目录内文件可能带有“来自互联网”标记。需要时可以先对当前目录批量解除限制：
 
 ```powershell
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+Get-ChildItem -Recurse | Unblock-File
 .\start.ps1
+```
+
+也可以直接使用一次性绕过执行策略的方式启动：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\start.ps1
 ```
 
 ### macOS / Linux
