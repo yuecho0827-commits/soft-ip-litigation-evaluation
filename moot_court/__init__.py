@@ -7,16 +7,6 @@
   - agents.py:     原告/被告/法官三个Agent类 + LLM调用封装
   - procedure.py:  五步庭审编排器 + 结果数据结构
 """
-
 from .procedure import MootCourtProcedure, MootCourtResult, RoundResult, run_moot_court
 from .agents import PlaintiffAgent, DefendantAgent, JudgeAgent
-
-__all__ = [
-    "MootCourtProcedure",
-    "MootCourtResult",
-    "RoundResult",
-    "run_moot_court",
-    "PlaintiffAgent",
-    "DefendantAgent",
-    "JudgeAgent",
-]
+__all__ = ['MootCourtProcedure', 'MootCourtResult', 'RoundResult', 'run_moot_court', 'PlaintiffAgent', 'DefendantAgent', 'JudgeAgent']
